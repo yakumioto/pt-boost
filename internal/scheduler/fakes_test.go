@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -81,6 +82,15 @@ type fakeTorrentFSEntry struct {
 // so AddTorrent can report a deterministic identity without a real
 // bencode/SHA1 implementation.
 type fakeTorrentFS struct {
+	// mu guards every field below. A real torrentfs-go REST client would
+	// be hit by both the scan loop and the cold-detection loop (see
+	// scheduler.go's own mu), so this fake must tolerate the same
+	// concurrent access rather than racing on its maps/slices — that
+	// would be a bug in the test double, not in Scheduler, and would
+	// make TestConcurrentScanAndDetectColdTorrents_NoDataRace (below)
+	// meaningless under -race.
+	mu sync.Mutex
+
 	entries         map[string]*fakeTorrentFSEntry // by torrentfs id
 	infoHashByBytes map[string]string              // string(bytes) -> infohash
 	nextID          int
@@ -110,6 +120,9 @@ func newFakeTorrentFS() *fakeTorrentFS {
 }
 
 func (f *fakeTorrentFS) AddTorrent(ctx context.Context, torrentBytes []byte) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.calls != nil {
 		*f.calls = append(*f.calls, "TorrentFS.AddTorrent")
 	}
@@ -125,6 +138,9 @@ func (f *fakeTorrentFS) AddTorrent(ctx context.Context, torrentBytes []byte) (st
 }
 
 func (f *fakeTorrentFS) SetCategory(ctx context.Context, id, category string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.calls != nil {
 		*f.calls = append(*f.calls, "TorrentFS.SetCategory")
 	}
@@ -138,6 +154,9 @@ func (f *fakeTorrentFS) SetCategory(ctx context.Context, id, category string) er
 }
 
 func (f *fakeTorrentFS) TriggerPieceDownload(ctx context.Context, id string, byteRange ByteRange) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.calls != nil {
 		*f.calls = append(*f.calls, "TorrentFS.TriggerPieceDownload")
 	}
@@ -151,6 +170,9 @@ func (f *fakeTorrentFS) TriggerPieceDownload(ctx context.Context, id string, byt
 }
 
 func (f *fakeTorrentFS) ListTorrents(ctx context.Context) ([]TorrentView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	var out []TorrentView
 	for id, e := range f.entries {
 		if e.deleted {
@@ -167,6 +189,9 @@ func (f *fakeTorrentFS) ListTorrents(ctx context.Context) ([]TorrentView, error)
 }
 
 func (f *fakeTorrentFS) DeleteTorrent(ctx context.Context, id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.calls != nil {
 		*f.calls = append(*f.calls, "TorrentFS.DeleteTorrent")
 	}
@@ -187,6 +212,8 @@ func (f *fakeTorrentFS) GetOperation(ctx context.Context, operationID string) (O
 // cumulative uploaded bytes, simulating real BT upload progress between
 // DetectColdTorrents ticks.
 func (f *fakeTorrentFS) setUploaded(id string, bytes int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if e, ok := f.entries[id]; ok {
 		e.uploadedBytes = bytes
 	}

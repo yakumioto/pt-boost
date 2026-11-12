@@ -17,11 +17,27 @@ import (
 // default of 10, overridable per site.
 const defaultPoolSize = 10
 
+// defaultStatusListenAddr is used whenever the optional status.listen_addr
+// field is omitted. It deliberately differs from torrentfs-go's typical
+// 8080 default (see design-overview.md's example base_url) to avoid a
+// same-host port clash when both run outside Docker's per-container
+// network namespace.
+const defaultStatusListenAddr = ":8081"
+
 // Config is the root of pt-boost's configuration: how to reach torrentfs-go,
-// and the list of PT sites to run a scheduler for.
+// the list of PT sites to run a scheduler for, and where to serve the
+// read-only GET /status endpoint (docs/design-overview.md §7 / issue #7).
 type Config struct {
 	TorrentFS TorrentFSConfig
 	Sites     []SiteConfig
+	Status    StatusConfig
+}
+
+// StatusConfig configures the GET /status HTTP endpoint. There is
+// deliberately no Prometheus /metrics equivalent in v1 (issue #7 rules it
+// out explicitly).
+type StatusConfig struct {
+	ListenAddr string `yaml:"listen_addr"`
 }
 
 // TorrentFSConfig holds how to reach the torrentfs-go instance pt-boost
@@ -59,6 +75,7 @@ type SiteConfig struct {
 type rawConfig struct {
 	TorrentFS TorrentFSConfig `yaml:"torrentfs"`
 	Sites     []rawSiteConfig `yaml:"sites"`
+	Status    StatusConfig    `yaml:"status"`
 }
 
 type rawSiteConfig struct {
@@ -134,7 +151,12 @@ func Parse(data []byte) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 
-	return &Config{TorrentFS: raw.TorrentFS, Sites: sites}, nil
+	status := raw.Status
+	if status.ListenAddr == "" {
+		status.ListenAddr = defaultStatusListenAddr
+	}
+
+	return &Config{TorrentFS: raw.TorrentFS, Sites: sites, Status: status}, nil
 }
 
 func convertSite(i int, rs rawSiteConfig) (SiteConfig, []error) {

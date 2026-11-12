@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/yakumioto/pt-boost/internal/config"
 	"github.com/yakumioto/pt-boost/internal/scheduler"
 	"github.com/yakumioto/pt-boost/internal/site/mteam"
+	"github.com/yakumioto/pt-boost/internal/statusapi"
 	"github.com/yakumioto/pt-boost/internal/torrentfs"
 )
 
@@ -50,7 +52,14 @@ func run(configPath string, logger *slog.Logger) error {
 	torrentFS := torrentfs.New(cfg.TorrentFS.BaseURL, cfg.TorrentFS.Username, cfg.TorrentFS.Password)
 
 	sites := make([]app.SiteRunner, 0, len(cfg.Sites))
+	statusSites := make([]statusapi.Site, 0, len(cfg.Sites))
 	for _, site := range cfg.Sites {
+		// Every log line this site's Scheduler emits is tagged with its
+		// site name up front, so operators reading combined stderr
+		// output (or /status) can attribute an event without the
+		// scheduler package itself knowing about multi-site wiring.
+		siteLogger := logger.With("site", site.Name)
+
 		// v1 wires every configured site to the M-Team adapter (see
 		// GLOSSARY.md "站点适配器 (Site Adapter)": the Site interface is
 		// generic, but only M-Team has a real implementation today).
@@ -74,7 +83,7 @@ func run(configPath string, logger *slog.Logger) error {
 			TargetShareBytes:  site.TargetShareBytes.Bytes,
 			ColdWindow:        site.ColdWindow.Duration,
 			ColdRateThreshold: site.ColdRateThreshold.BytesPerSecond,
-		})
+		}, scheduler.WithLogger(siteLogger))
 
 		sites = append(sites, app.SiteRunner{
 			Name:              site.Name,
@@ -82,17 +91,43 @@ func run(configPath string, logger *slog.Logger) error {
 			ScanInterval:      site.ScanInterval.Duration,
 			ColdCheckInterval: coldCheckInterval,
 		})
+		statusSites = append(statusSites, statusapi.Site{Name: site.Name, Reporter: sched})
 	}
 
-	// Cancel on SIGINT/SIGTERM so every site's ticker loops (and any
-	// in-flight HTTP call that respects ctx) unwind instead of leaving the
-	// process to hang or be killed mid-request.
+	// Cancel on SIGINT/SIGTERM so every site's ticker loops, the /status
+	// server, and any in-flight HTTP call that respects ctx unwind
+	// instead of leaving the process to hang or be killed mid-request.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	statusServer := &http.Server{
+		Addr:    cfg.Status.ListenAddr,
+		Handler: statusapi.NewHandler(statusSites),
+	}
+	statusServerDone := make(chan struct{})
+	go func() {
+		defer close(statusServerDone)
+		logger.Info("status endpoint listening", "addr", cfg.Status.ListenAddr)
+		if err := statusServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("status endpoint stopped unexpectedly", "error", err)
+		}
+	}()
 
 	logger.Info("pt-boost starting", "sites", len(sites))
 	runner := &app.Runner{Sites: sites, Logger: logger}
 	runner.Run(ctx)
+
+	// runner.Run only returns once ctx is cancelled (SIGINT/SIGTERM), so
+	// shut the status server down on the same signal rather than leaving
+	// it to be killed: give in-flight GET /status requests a short grace
+	// period to finish instead of dropping them mid-response.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := statusServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("status endpoint did not shut down cleanly", "error", err)
+	}
+	<-statusServerDone
+
 	logger.Info("pt-boost stopped")
 	return nil
 }

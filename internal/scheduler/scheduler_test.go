@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -385,4 +386,60 @@ func TestRebuildFromTorrentFS_FiltersByCategoryWithEmptySampleWindows(t *testing
 	if sched.Pool()[0].Cold {
 		t.Errorf("rebuilt member must not be judged cold from a single post-rebuild sample")
 	}
+}
+
+// TestConcurrentScanAndDetectColdTorrents_NoDataRace guards the mutex
+// added to Scheduler for issue #7: in production, Runner (internal/app)
+// drives Scan and DetectColdTorrents for the same Scheduler from two
+// independent goroutines (the scan loop and the cold-detection loop never
+// share a ticker), and the /status HTTP handler (internal/statusapi) reads
+// Pool()/LastScanAt() from a third goroutine. Before that mutex existed,
+// `go test -race` did not catch this because every other test in this
+// package calls Scheduler from a single goroutine. Run with -race to be
+// meaningful; without it, this test only proves the code doesn't
+// deadlock/panic, not that it's race-free.
+func TestConcurrentScanAndDetectColdTorrents_NoDataRace(t *testing.T) {
+	candidates := []Candidate{
+		{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100},
+		{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90},
+	}
+	site := &fakeSite{candidates: candidates}
+	fetcher := &fakeFetcher{}
+	tfs := newFakeTorrentFS()
+	for _, c := range candidates {
+		setupLanding(site, fetcher, tfs, c)
+	}
+
+	params := baseParams()
+	params.PoolSize = 2
+	params.ColdWindow = time.Millisecond // tiny, so DetectColdTorrents does real work fast
+	// fakeClock.Now() is only ever read concurrently in this test (no
+	// Advance calls while goroutines run below), which is race-safe.
+	sched := New(site, tfs, fetcher, newFakeClock(time.Now()), params)
+
+	const iterations = 200
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = sched.Scan(ctx) // reuses the same two candidates every call; harmless once pooled
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = sched.DetectColdTorrents(ctx)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = sched.Pool()
+			_ = sched.LastScanAt()
+		}
+	}()
+
+	wg.Wait()
 }

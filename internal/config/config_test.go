@@ -55,6 +55,20 @@ func TestParse_MinimalValidYAML(t *testing.T) {
 	if site.MaxScanPages != 3 || site.PageSize != 100 {
 		t.Errorf("paging fields wrong: max_scan_pages=%d page_size=%d", site.MaxScanPages, site.PageSize)
 	}
+	if cfg.Status.ListenAddr != defaultStatusListenAddr {
+		t.Errorf("Status.ListenAddr = %q, want default %q (status section omitted)", cfg.Status.ListenAddr, defaultStatusListenAddr)
+	}
+}
+
+func TestParse_StatusListenAddrExplicitOverridesDefault(t *testing.T) {
+	yaml := minimalValidYAML + "\nstatus:\n  listen_addr: \"127.0.0.1:9100\"\n"
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse returned error: %v", err)
+	}
+	if cfg.Status.ListenAddr != "127.0.0.1:9100" {
+		t.Errorf("Status.ListenAddr = %q, want 127.0.0.1:9100", cfg.Status.ListenAddr)
+	}
 }
 
 func TestParse_PoolSizeDefaultsTo10WhenOmitted(t *testing.T) {
