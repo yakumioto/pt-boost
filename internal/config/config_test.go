@@ -212,6 +212,44 @@ func TestLoad_ReadsFileAndParses(t *testing.T) {
 	}
 }
 
+func TestLoad_ExpandsEnvVarPlaceholderInFile(t *testing.T) {
+	t.Setenv("PT_BOOST_TEST_API_KEY", "secret-from-env")
+
+	yamlWithPlaceholder := strings.Replace(minimalValidYAML, "api_key: abc123", "api_key: ${PT_BOOST_TEST_API_KEY}", 1)
+	dir := t.TempDir()
+	path := dir + "/config.yaml"
+	if err := os.WriteFile(path, []byte(yamlWithPlaceholder), 0o600); err != nil {
+		t.Fatalf("failed to write temp config file: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Sites[0].APIKey != "secret-from-env" {
+		t.Errorf("APIKey = %q, want expanded env var value", cfg.Sites[0].APIKey)
+	}
+}
+
+func TestLoad_UnsetEnvVarPlaceholderLeftVerbatim(t *testing.T) {
+	os.Unsetenv("PT_BOOST_TEST_UNSET_VAR")
+
+	yamlWithPlaceholder := strings.Replace(minimalValidYAML, "api_key: abc123", "api_key: ${PT_BOOST_TEST_UNSET_VAR}", 1)
+	dir := t.TempDir()
+	path := dir + "/config.yaml"
+	if err := os.WriteFile(path, []byte(yamlWithPlaceholder), 0o600); err != nil {
+		t.Fatalf("failed to write temp config file: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Sites[0].APIKey != "${PT_BOOST_TEST_UNSET_VAR}" {
+		t.Errorf("APIKey = %q, want the placeholder left verbatim when the env var is unset", cfg.Sites[0].APIKey)
+	}
+}
+
 func TestLoad_MissingFileReturnsError(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	if err == nil {

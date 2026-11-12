@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 
 	"gopkg.in/yaml.v3"
 )
@@ -77,13 +78,35 @@ type rawSiteConfig struct {
 	ColdRateThreshold string `yaml:"cold_rate_threshold"`
 }
 
-// Load reads the YAML file at path and parses it into a Config.
+// envVarPattern matches "${NAME}" placeholders so secrets such as
+// sites[].api_key can be kept out of the YAML file (and out of git) and
+// supplied via the environment or a sibling .env file instead (see
+// cmd/pt-boost/main.go). Only the braced form is recognized, so a bare "$"
+// in, say, a URL or torrent name is never mistaken for a placeholder.
+var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// expandEnv replaces every "${NAME}" placeholder in data with the value of
+// the environment variable NAME. A placeholder whose variable is unset is
+// left verbatim, so Parse's required-field validation still surfaces a
+// useful "missing or empty" error instead of silently swallowing it.
+func expandEnv(data []byte) []byte {
+	return envVarPattern.ReplaceAllFunc(data, func(match []byte) []byte {
+		name := string(match[2 : len(match)-1])
+		if v, ok := os.LookupEnv(name); ok {
+			return []byte(v)
+		}
+		return match
+	})
+}
+
+// Load reads the YAML file at path, expands any "${NAME}" environment
+// variable placeholders it contains, and parses the result into a Config.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
-	return Parse(data)
+	return Parse(expandEnv(data))
 }
 
 // Parse decodes YAML bytes into a validated Config. It applies defaults

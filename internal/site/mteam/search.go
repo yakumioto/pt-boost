@@ -160,11 +160,20 @@ func (c *Client) GetTorrentDetail(ctx context.Context, torrentID string) (schedu
 	return scheduler.Detail{InfoHash: string(data.InfoHash)}, nil
 }
 
-// Fetch implements scheduler.TorrentFileFetcher. M-Team's genDlToken
-// returns a ready-to-use (pre-signed) download URL, so fetching the raw
-// .torrent bytes is a plain unauthenticated GET — no x-api-key needed.
+// Fetch implements scheduler.TorrentFileFetcher. M-Team's genDlToken is
+// documented (and corroborated by public client implementations) to
+// return a ready-to-use (pre-signed) absolute download URL, so fetching
+// the raw .torrent bytes is normally a plain unauthenticated GET — no
+// x-api-key needed. Given the same API's well-documented inconsistencies
+// elsewhere (code/id/seeders/leechers field typing), this also tolerates a
+// server that returns a bare path instead, resolving it against baseURL.
 func (c *Client) Fetch(ctx context.Context, downloadToken string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadToken, nil)
+	target := downloadToken
+	if parsed, err := url.Parse(downloadToken); err == nil && parsed.Scheme == "" {
+		target = c.baseURL + downloadToken
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building download request: %w", err)
 	}

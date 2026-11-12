@@ -380,6 +380,30 @@ func TestFetch_NotFoundReturnsError(t *testing.T) {
 	}
 }
 
+func TestFetch_RelativeTokenResolvedAgainstBaseURL(t *testing.T) {
+	// Regression test: a manual smoke run against a fake M-Team server
+	// returning a bare path (e.g. "/fetch/mt-1") from genDlToken instead
+	// of an absolute URL surfaced "unsupported protocol scheme" from
+	// Fetch, because GetDownloadToken's result was passed to Fetch
+	// unmodified (as Scheduler.land really does) with no base URL to
+	// resolve against. Fetch must tolerate this even though a real
+	// M-Team instance is documented/expected to always return an
+	// absolute, pre-signed URL.
+	fs := newFakeServer()
+	fs.torrentBytes["77"] = []byte("relative-path-bytes")
+	srv := httptest.NewServer(fs.handler())
+	defer srv.Close()
+
+	c := newTestClient(t, srv, 10, 50)
+	body, err := c.Fetch(context.Background(), "/fetch/77")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if string(body) != "relative-path-bytes" {
+		t.Errorf("body = %q, want %q", body, "relative-path-bytes")
+	}
+}
+
 func TestEndToEnd_SearchThenTokenThenFetch(t *testing.T) {
 	fs := newFakeServer()
 	fs.searchPages = [][]searchResultItem{{item("55", 20, 100)}}
@@ -405,7 +429,10 @@ func TestEndToEnd_SearchThenTokenThenFetch(t *testing.T) {
 		t.Fatalf("GetDownloadToken: %v", err)
 	}
 
-	body, err := c.Fetch(ctx, srv.URL+token)
+	// token is used exactly as GetDownloadToken returned it: Scheduler
+	// never prefixes it with anything (Site is an opaque black box to
+	// Scheduler), so Fetch itself must be able to resolve it.
+	body, err := c.Fetch(ctx, token)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
