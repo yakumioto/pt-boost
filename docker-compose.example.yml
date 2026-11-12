@@ -1,0 +1,49 @@
+# Illustrative docker-compose example for issue #8 / docs/deployment.md.
+#
+# pt-boost never bundles, builds, or configures torrentfs-go for you (see
+# ADR 0001 and design-overview.md's "范围边界": torrentfs-go is an
+# opaque, independently-deployed external service that pt-boost only
+# talks to over its REST API). The `torrentfs` service below is a
+# PLACEHOLDER showing the network shape, not something this repo builds —
+# replace its `image:`/`build:` with your own torrentfs-go deployment
+# (it has no official published image as of this writing; build one from
+# https://github.com/yakumioto/torrentfs-go yourself).
+#
+# Copy this file to docker-compose.yml, fill in ./config.yaml (see
+# docs/design-overview.md's YAML example) and a sibling .env with your
+# site credentials (config.yaml references them as ${MTEAM_TOKEN} etc.,
+# see internal/config's "${NAME}" placeholder expansion), then:
+#   docker compose up -d
+
+services:
+  torrentfs:
+    # Placeholder — see the comment above. torrentfs-go's own config
+    # (cache capacity, backend mode, experiments.upload, etc.) is
+    # entirely its deployment's concern; pt-boost only needs its
+    # base_url + credentials (torrentfs.base_url/username/password in
+    # pt-boost's config.yaml).
+    image: ghcr.io/yakumioto/torrentfs-go:nightly
+    volumes:
+      - ./torrentfs.toml:/etc/torrentfs/torrentfs.toml:ro
+      - torrentfs-data:/data
+    ports:
+      - "8080:8080" # torrentfs-go's own HTTP API; only pt-boost needs to reach it
+    restart: unless-stopped
+
+  pt-boost:
+    build: .
+    depends_on:
+      - torrentfs
+    volumes:
+      - ./config.yaml:/etc/pt-boost/config.yaml:ro
+    env_file:
+      - .env # supplies secrets referenced in config.yaml as ${NAME}
+    ports:
+      - "8081:8081" # GET /status
+    restart: unless-stopped
+    # No extra stop_grace_period override needed: main.go cancels its
+    # context on SIGTERM and shuts the /status server down within a 5s
+    # internal timeout, well inside Compose's default 10s grace period.
+
+volumes:
+  torrentfs-data:
