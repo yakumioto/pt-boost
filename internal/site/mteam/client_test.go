@@ -138,14 +138,12 @@ func writeEnvelope(w http.ResponseWriter, data any) {
 	})
 }
 
-func newTestClient(t *testing.T, srv *httptest.Server, seedersMin, leechersMin int, opts ...Option) *Client {
+func newTestClient(t *testing.T, srv *httptest.Server, opts ...Option) *Client {
 	t.Helper()
 	baseOpts := append([]Option{withSleep(func(time.Duration) {})}, opts...)
 	return New(Config{
-		BaseURL:     srv.URL,
-		APIKey:      "test-key",
-		SeedersMin:  seedersMin,
-		LeechersMin: leechersMin,
+		BaseURL: srv.URL,
+		APIKey:  "test-key",
 	}, baseOpts...)
 }
 
@@ -167,7 +165,7 @@ func TestSearchHotTorrents_PaginatesAndStopsOnShortPage(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	candidates, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 5, PageSize: 2})
 	if err != nil {
 		t.Fatalf("SearchHotTorrents: %v", err)
@@ -187,7 +185,7 @@ func TestSearchHotTorrents_SendsAllModeAndLeechersDescSort(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	_, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 1, PageSize: 10})
 	if err != nil {
 		t.Fatalf("SearchHotTorrents: %v", err)
@@ -205,28 +203,37 @@ func TestSearchHotTorrents_SendsAllModeAndLeechersDescSort(t *testing.T) {
 	}
 }
 
-func TestSearchHotTorrents_FiltersBelowThresholdsWithoutCallingDetail(t *testing.T) {
+// TestSearchHotTorrents_ReturnsRawCandidatesWithoutFilteringByThreshold is
+// a regression test for the spec realignment in issue #5: this adapter
+// must return the raw candidate list, with no local seeders/leechers
+// threshold filtering of its own — pool-membership thresholds are
+// scheduler.Scheduler.Scan's sole responsibility (it re-applies them
+// independently). Even a candidate with very low seeders/leechers must
+// still get its InfoHash resolved via GetTorrentDetail and be returned.
+func TestSearchHotTorrents_ReturnsRawCandidatesWithoutFilteringByThreshold(t *testing.T) {
 	fs := newFakeServer()
 	fs.searchPages = [][]searchResultItem{{
-		item("low-seeders", 10, 100), // seeders == min, not > min: filtered
-		item("low-leechers", 20, 50), // leechers == min, not > min: filtered
-		item("qualifies", 20, 100),   // strictly above both: kept
+		item("barely-alive", 1, 1), // would fail any sane threshold
 	}}
-	fs.detailInfoHash = map[string]string{"qualifies": "hash-q"}
+	fs.detailInfoHash = map[string]string{"barely-alive": "hash-low"}
 
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	candidates, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 1, PageSize: 10})
 	if err != nil {
 		t.Fatalf("SearchHotTorrents: %v", err)
 	}
-	if len(candidates) != 1 || candidates[0].TorrentID != "qualifies" {
-		t.Fatalf("got %+v, want only the qualifying candidate", candidates)
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1 (no local threshold filtering)", len(candidates))
+	}
+	got := candidates[0]
+	if got.TorrentID != "barely-alive" || got.Seeders != 1 || got.Leechers != 1 {
+		t.Fatalf("got %+v, want the low-seeders/leechers candidate returned as-is", got)
 	}
 	if fs.detailCallCount != 1 {
-		t.Fatalf("detail called %d times, want 1 (filtered candidates must not trigger a detail call)", fs.detailCallCount)
+		t.Fatalf("detail called %d times, want 1 (detail must be resolved for every raw candidate)", fs.detailCallCount)
 	}
 }
 
@@ -238,7 +245,7 @@ func TestSearchHotTorrents_ResolvesInfoHashViaDetail(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	candidates, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 1, PageSize: 10})
 	if err != nil {
 		t.Fatalf("SearchHotTorrents: %v", err)
@@ -263,7 +270,7 @@ func TestSearchHotTorrents_RetriesOn429(t *testing.T) {
 	defer srv.Close()
 
 	var sleeps []time.Duration
-	c := New(Config{BaseURL: srv.URL, APIKey: "k", SeedersMin: 10, LeechersMin: 50},
+	c := New(Config{BaseURL: srv.URL, APIKey: "k"},
 		withSleep(func(d time.Duration) { sleeps = append(sleeps, d) }))
 
 	_, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 1, PageSize: 10})
@@ -302,7 +309,7 @@ func TestSearchHotTorrents_PacesBetweenSearchPages(t *testing.T) {
 	defer srv.Close()
 
 	var sleeps []time.Duration
-	c := New(Config{BaseURL: srv.URL, APIKey: "k", SeedersMin: 10, LeechersMin: 50},
+	c := New(Config{BaseURL: srv.URL, APIKey: "k"},
 		withSleep(func(d time.Duration) { sleeps = append(sleeps, d) }))
 
 	_, err := c.SearchHotTorrents(context.Background(), scheduler.SearchParams{MaxPages: 2, PageSize: 1})
@@ -326,7 +333,7 @@ func TestGetDownloadToken_SendsFormUrlEncoded(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	token, err := c.GetDownloadToken(context.Background(), "99")
 	if err != nil {
 		t.Fatalf("GetDownloadToken: %v", err)
@@ -345,7 +352,7 @@ func TestGetTorrentDetail_MissingInfoHashReturnsError(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	_, err := c.GetTorrentDetail(context.Background(), "7")
 	if err == nil {
 		t.Fatal("GetTorrentDetail: want error for missing infoHash, got nil")
@@ -358,7 +365,7 @@ func TestFetch_DownloadsRawBytesFromToken(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	body, err := c.Fetch(context.Background(), srv.URL+"/fetch/123")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -373,7 +380,7 @@ func TestFetch_NotFoundReturnsError(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	_, err := c.Fetch(context.Background(), srv.URL+"/fetch/missing")
 	if err == nil {
 		t.Fatal("Fetch: want error for missing torrent, got nil")
@@ -394,7 +401,7 @@ func TestFetch_RelativeTokenResolvedAgainstBaseURL(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	body, err := c.Fetch(context.Background(), "/fetch/77")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -413,7 +420,7 @@ func TestEndToEnd_SearchThenTokenThenFetch(t *testing.T) {
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
 
-	c := newTestClient(t, srv, 10, 50)
+	c := newTestClient(t, srv)
 	ctx := context.Background()
 
 	candidates, err := c.SearchHotTorrents(ctx, scheduler.SearchParams{MaxPages: 1, PageSize: 10})

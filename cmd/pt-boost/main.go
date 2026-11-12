@@ -67,12 +67,13 @@ func run(configPath string, logger *slog.Logger) error {
 		// future site.Type field here, once a second adapter package
 		// exists; nothing in internal/scheduler changes.
 		mteamClient := mteam.New(mteam.Config{
-			BaseURL:     site.BaseURL,
-			APIKey:      site.APIKey,
-			SeedersMin:  site.SeedersMin,
-			LeechersMin: site.LeechersMin,
+			BaseURL: site.BaseURL,
+			APIKey:  site.APIKey,
 		}, mteam.WithSearchInterval(site.RequestInterval.Duration))
 
+		// mteamClient is passed twice below: once as the Site and once as
+		// the TorrentFileFetcher — the same *mteam.Client instance
+		// implements both scheduler interfaces.
 		sched := scheduler.New(mteamClient, torrentFS, mteamClient, scheduler.SystemClock{}, scheduler.Params{
 			Category:          site.Category,
 			PoolSize:          site.PoolSize,

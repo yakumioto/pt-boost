@@ -59,14 +59,14 @@ type detailResponseData struct {
 
 // SearchHotTorrents implements scheduler.Site. It pages through
 // /api/torrent/search sorted by LEECHERS descending (respecting the
-// guide's ≥2.5s inter-search pacing), locally pre-filters out candidates
-// that are certain to fail the scheduler's own seeders/leechers thresholds
-// (a pure performance optimization — the scheduler package remains the
-// sole authority on pool-membership decisions), and resolves each
-// surviving candidate's InfoHash via GetTorrentDetail, since M-Team's
-// search results are not known to carry InfoHash directly (see package doc
-// and internal/scheduler/interfaces.go's Detail comment, which anticipated
-// exactly this case).
+// guide's ≥2.5s inter-search pacing) and resolves every returned
+// candidate's InfoHash via GetTorrentDetail, since M-Team's search results
+// are not known to carry InfoHash directly (see package doc and
+// internal/scheduler/interfaces.go's Detail comment, which anticipated
+// exactly this case). Per issue #5, this method returns the raw candidate
+// list unfiltered: it does not apply any seeders/leechers threshold —
+// scheduler.Scheduler.Scan is the sole authority on pool-membership
+// decisions.
 func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchParams) ([]scheduler.Candidate, error) {
 	var raw []searchResultItem
 
@@ -100,9 +100,6 @@ func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchP
 	for _, item := range raw {
 		seeders := int(item.Status.Seeders)
 		leechers := int(item.Status.Leechers)
-		if seeders <= c.seedersMin || leechers <= c.leechersMin {
-			continue
-		}
 
 		c.paceOther()
 		detail, err := c.GetTorrentDetail(ctx, string(item.ID))

@@ -153,14 +153,22 @@ func (c *Client) login(ctx context.Context) (string, error) {
 // authedRequest builds an HTTP request against baseURL+path with a fresh
 // Authorization header, retrying the token lookup once if the first
 // request comes back 401 (the server may have invalidated a token this
-// client still thinks is fresh, e.g. after a restart).
-func (c *Client) authedRequest(ctx context.Context, method, path string, body io.Reader, contentType string) (*http.Response, error) {
+// client still thinks is fresh, e.g. after a restart). body is the
+// already-serialized request body (nil for no body); unlike an io.Reader,
+// a []byte is safe to re-wrap and replay on every attempt, so every
+// authedRequest caller — including a retried one — gets the transparent
+// 401-retry, not just the no-body callers.
+func (c *Client) authedRequest(ctx context.Context, method, path string, body []byte, contentType string) (*http.Response, error) {
 	doOnce := func() (*http.Response, error) {
 		token, err := c.ensureToken(ctx)
 		if err != nil {
 			return nil, err
 		}
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 		if err != nil {
 			return nil, err
 		}
@@ -175,9 +183,7 @@ func (c *Client) authedRequest(ctx context.Context, method, path string, body io
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == http.StatusUnauthorized && body == nil {
-		// Only safe to retry when the body isn't a one-shot reader that's
-		// already been consumed.
+	if resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
 		c.mu.Lock()
 		c.token = ""
@@ -187,12 +193,26 @@ func (c *Client) authedRequest(ctx context.Context, method, path string, body io
 	return resp, nil
 }
 
+// checkStatus returns an error describing action's failure (including the
+// response body) if resp's status code is not in the 2xx range, and nil
+// otherwise. It does not close resp.Body; callers remain responsible for
+// that.
+func checkStatus(resp *http.Response, action string) error {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s failed with status %d: %s", action, resp.StatusCode, body)
+	}
+	return nil
+}
+
 type addTorrentResponse struct {
 	ID string `json:"id"`
 }
 
 // AddTorrent uploads raw .torrent bytes via multipart/form-data, field
-// "file", and returns torrentfs-go's internal id for it.
+// "file", and returns torrentfs-go's internal id for it. Like every other
+// method here, it goes through authedRequest so a stale (server-expired)
+// token is transparently retried once, instead of failing outright.
 func (c *Client) AddTorrent(ctx context.Context, torrentBytes []byte) (string, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -207,18 +227,7 @@ func (c *Client) AddTorrent(ctx context.Context, torrentBytes []byte) (string, e
 		return "", fmt.Errorf("closing multipart body: %w", err)
 	}
 
-	token, err := c.ensureToken(ctx)
-	if err != nil {
-		return "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/torrents", &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.authedRequest(ctx, http.MethodPost, "/api/v1/torrents", buf.Bytes(), writer.FormDataContentType())
 	if err != nil {
 		return "", fmt.Errorf("adding torrent: %w", err)
 	}
@@ -253,16 +262,12 @@ func (c *Client) SetCategory(ctx context.Context, id, category string) error {
 	if err != nil {
 		return fmt.Errorf("encoding set-category request: %w", err)
 	}
-	resp, err := c.authedRequest(ctx, http.MethodPut, "/api/v1/torrents/"+id+"/category", bytes.NewReader(body), "application/json")
+	resp, err := c.authedRequest(ctx, http.MethodPut, "/api/v1/torrents/"+id+"/category", body, "application/json")
 	if err != nil {
 		return fmt.Errorf("setting category: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("setting category failed with status %d: %s", resp.StatusCode, respBody)
-	}
-	return nil
+	return checkStatus(resp, "setting category")
 }
 
 type pieceDownloadRequest struct {
@@ -277,16 +282,12 @@ func (c *Client) TriggerPieceDownload(ctx context.Context, id string, byteRange 
 	if err != nil {
 		return fmt.Errorf("encoding piece-download request: %w", err)
 	}
-	resp, err := c.authedRequest(ctx, http.MethodPut, "/api/v1/torrents/"+id+"/piece-download", bytes.NewReader(body), "application/json")
+	resp, err := c.authedRequest(ctx, http.MethodPut, "/api/v1/torrents/"+id+"/piece-download", body, "application/json")
 	if err != nil {
 		return fmt.Errorf("triggering piece download: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("triggering piece download failed with status %d: %s", resp.StatusCode, respBody)
-	}
-	return nil
+	return checkStatus(resp, "triggering piece download")
 }
 
 type torrentListEntry struct {

@@ -477,6 +477,27 @@ func TestAuthedRequest_TransparentlyRetriesOnStale401(t *testing.T) {
 	}
 }
 
+func TestAddTorrent_TransparentlyRetriesOnStale401(t *testing.T) {
+	server := newFakeServer()
+	server.authFailuresToInject = 1 // first authed call anywhere gets a 401
+	c, _ := newTestClient(t, server)
+
+	// AddTorrent builds its own multipart body ahead of calling
+	// authedRequest; it must still survive a stale-401 retry (that body
+	// is a []byte under the hood, safe to replay) rather than failing
+	// outright like a true one-shot io.Reader would.
+	id, err := c.AddTorrent(context.Background(), []byte("d8:announce...retry-torrent-bytes"))
+	if err != nil {
+		t.Fatalf("AddTorrent returned error despite stale-token retry support: %v", err)
+	}
+	if id == "" {
+		t.Error("AddTorrent returned empty id")
+	}
+	if server.loginCalls != 2 {
+		t.Errorf("login called %d times, want 2 (initial + retry after 401)", server.loginCalls)
+	}
+}
+
 func TestEndToEnd_AddCategorizePieceDownloadListDelete(t *testing.T) {
 	server := newFakeServer()
 	c, _ := newTestClient(t, server)

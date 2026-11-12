@@ -58,6 +58,22 @@ type Site interface {
 // Site.GetDownloadToken) into the raw .torrent file bytes. It is a thin,
 // site-agnostic HTTP dependency, kept separate from Site so Scheduler tests
 // can fake "the network" without needing a fake HTTP server.
+//
+// Top-level spec (issue #1, User Story 29) literally asks for Scheduler to
+// depend on "两个可替换的外部接口" (two swappable external interfaces):
+// a site adapter and a torrentfs-go client. Declaring TorrentFileFetcher
+// as its own Go interface, distinct from Site, means Scheduler actually
+// depends on three Go interfaces (Site, TorrentFSClient,
+// TorrentFileFetcher), not two. This is a deliberate, already-evaluated
+// deviation from that literal wording, not an oversight: in production
+// there are still only two physical objects (mteam.Client implements both
+// Site and TorrentFileFetcher; torrentfs.Client implements
+// TorrentFSClient alone), so User Story 29's real goal — Scheduler's
+// decision logic being testable end-to-end against pure in-memory fakes,
+// with no real network or HTTP server involved — is fully met either way.
+// Splitting out TorrentFileFetcher additionally lets "download the raw
+// .torrent bytes for a given token" be faked on its own, without having to
+// spin up a fake HTTP server just to exercise that one step.
 type TorrentFileFetcher interface {
 	Fetch(ctx context.Context, downloadToken string) ([]byte, error)
 }

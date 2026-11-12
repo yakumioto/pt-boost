@@ -32,26 +32,22 @@ const (
 	maxRetries            = 3
 )
 
-// Config holds the fixed per-site settings for an M-Team Client. SeedersMin
-// and LeechersMin are a performance pre-filter only (see search.go): the
-// scheduler package remains the sole authority on pool-membership
-// thresholds; this just avoids spending a detail-resolution call on
-// candidates that are certain to be rejected anyway.
+// Config holds the fixed per-site settings for an M-Team Client. Pool-
+// membership thresholds (seeders/leechers minimums) are deliberately not
+// part of this Config: per issue #5, this adapter returns raw candidates
+// only, and scheduler.Scheduler.Scan is the sole authority on threshold
+// filtering.
 type Config struct {
-	BaseURL     string
-	APIKey      string
-	SeedersMin  int
-	LeechersMin int
+	BaseURL string
+	APIKey  string
 }
 
 // Client implements scheduler.Site and scheduler.TorrentFileFetcher.
 type Client struct {
-	baseURL     string
-	apiKey      string
-	seedersMin  int
-	leechersMin int
-	httpClient  *http.Client
-	sleep       func(time.Duration)
+	baseURL    string
+	apiKey     string
+	httpClient *http.Client
+	sleep      func(time.Duration)
 
 	searchInterval time.Duration
 	detailInterval time.Duration
@@ -88,8 +84,6 @@ func New(cfg Config, opts ...Option) *Client {
 	c := &Client{
 		baseURL:        strings.TrimRight(cfg.BaseURL, "/"),
 		apiKey:         cfg.APIKey,
-		seedersMin:     cfg.SeedersMin,
-		leechersMin:    cfg.LeechersMin,
 		httpClient:     http.DefaultClient,
 		sleep:          time.Sleep,
 		searchInterval: defaultSearchInterval,
@@ -141,21 +135,75 @@ type envelope struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+// unmarshalFlexible is the shared decoding strategy behind flexCode,
+// flexInt, and flexString: M-Team encodes several fields inconsistently as
+// either a JSON string or a JSON number, so each of these types tries one
+// JSON kind first (via primary) and falls back to the other (via
+// secondary) before giving up. The two callbacks encode which kind each
+// type prefers and in which order, so this refactor changes none of their
+// individual fallback directions.
+func unmarshalFlexible[T any](data []byte, primary, secondary func([]byte) (T, bool), typeName string) (T, error) {
+	if v, ok := primary(data); ok {
+		return v, nil
+	}
+	if v, ok := secondary(data); ok {
+		return v, nil
+	}
+	var zero T
+	return zero, fmt.Errorf("%s: cannot decode %s", typeName, data)
+}
+
+func tryJSONString(data []byte) (string, bool) {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func tryJSONNumberAsString(data []byte) (string, bool) {
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err != nil {
+		return "", false
+	}
+	return n.String(), true
+}
+
+func tryJSONNumberAsInt64(data []byte) (int64, bool) {
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err != nil {
+		return 0, false
+	}
+	i, err := n.Int64()
+	if err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
+func tryJSONStringAsInt64(data []byte) (int64, bool) {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return 0, false
+	}
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
 // flexCode decodes M-Team's inconsistently-typed "code" field (bare number,
-// numeric string, or "SUCCESS") into a comparable string form.
+// numeric string, or "SUCCESS") into a comparable string form. It tries a
+// JSON string first, falling back to a JSON number converted to string.
 type flexCode string
 
 func (f *flexCode) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*f = flexCode(s)
-		return nil
+	s, err := unmarshalFlexible(data, tryJSONString, tryJSONNumberAsString, "flexCode")
+	if err != nil {
+		return err
 	}
-	var n json.Number
-	if err := json.Unmarshal(data, &n); err != nil {
-		return fmt.Errorf("flexCode: cannot decode %s", data)
-	}
-	*f = flexCode(n.String())
+	*f = flexCode(s)
 	return nil
 }
 
@@ -165,43 +213,30 @@ func (f flexCode) isSuccess() bool {
 
 // flexInt decodes a field M-Team may encode as either a JSON number or a
 // numeric string (e.g. seeders/leechers), matching the FlexInt-style
-// workaround other public M-Team client implementations also needed.
+// workaround other public M-Team client implementations also needed. It
+// tries a JSON number first, falling back to a numeric JSON string.
 type flexInt int64
 
 func (f *flexInt) UnmarshalJSON(data []byte) error {
-	var n json.Number
-	if err := json.Unmarshal(data, &n); err == nil {
-		if i, err := n.Int64(); err == nil {
-			*f = flexInt(i)
-			return nil
-		}
-	}
-	var s string
-	if err := json.Unmarshal(data, &s); err != nil {
-		return fmt.Errorf("flexInt: cannot decode %s", data)
-	}
-	i, err := strconv.ParseInt(s, 10, 64)
+	i, err := unmarshalFlexible(data, tryJSONNumberAsInt64, tryJSONStringAsInt64, "flexInt")
 	if err != nil {
-		return fmt.Errorf("flexInt: cannot parse %q: %w", s, err)
+		return err
 	}
 	*f = flexInt(i)
 	return nil
 }
 
-// flexString is the same string/number flexibility for id-like fields.
+// flexString is the same string/number flexibility for id-like fields. It
+// tries a JSON string first, falling back to a JSON number converted to
+// string (the same order as flexCode).
 type flexString string
 
 func (f *flexString) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*f = flexString(s)
-		return nil
+	s, err := unmarshalFlexible(data, tryJSONString, tryJSONNumberAsString, "flexString")
+	if err != nil {
+		return err
 	}
-	var n json.Number
-	if err := json.Unmarshal(data, &n); err != nil {
-		return fmt.Errorf("flexString: cannot decode %s", data)
-	}
-	*f = flexString(n.String())
+	*f = flexString(s)
 	return nil
 }
 
