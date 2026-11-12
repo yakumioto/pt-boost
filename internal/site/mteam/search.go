@@ -45,30 +45,18 @@ type torrentStatus struct {
 	Leechers flexInt `json:"leechers"`
 }
 
-// detailRequest is the documented /api/torrent/detail request body. Origin
-// is marked required in the v2.2 spec; the guide notes the server
-// tolerates its absence, but this adapter sends it anyway.
-type detailRequest struct {
-	ID     string `json:"id"`
-	Origin string `json:"origin"`
-}
-
-type detailResponseData struct {
-	InfoHash flexString `json:"infoHash"`
-}
-
 // SearchHotTorrents implements scheduler.Site. It pages through
 // /api/torrent/search sorted by LEECHERS descending (respecting the
-// guide's ≥2.5s inter-search pacing) and resolves every returned
-// candidate's InfoHash via GetTorrentDetail, since M-Team's search results
-// are not known to carry InfoHash directly (see package doc and
-// internal/scheduler/interfaces.go's Detail comment, which anticipated
-// exactly this case). Per issue #5, this method returns the raw candidate
-// list unfiltered: it does not apply any seeders/leechers threshold —
+// guide's ≥2.5s inter-search pacing) and returns one candidate per result,
+// identified by M-Team's own torrent id only. It does not resolve an
+// infohash: M-Team's API does not expose one (/api/torrent/detail returns
+// infoHash: null in production), and Scheduler does not need it — see
+// ADR 0003. Per issue #5, this method returns the raw candidate list
+// unfiltered: it does not apply any seeders/leechers threshold —
 // scheduler.Scheduler.Scan is the sole authority on pool-membership
 // decisions.
 func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchParams) ([]scheduler.Candidate, error) {
-	var raw []searchResultItem
+	var candidates []scheduler.Candidate
 
 	for page := 1; page <= params.MaxPages; page++ {
 		c.paceSearch()
@@ -90,29 +78,16 @@ func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchP
 			return nil, fmt.Errorf("decoding search page %d: %w", page, err)
 		}
 
-		raw = append(raw, data.Data...)
+		for _, item := range data.Data {
+			candidates = append(candidates, scheduler.Candidate{
+				TorrentID: string(item.ID),
+				Seeders:   int(item.Status.Seeders),
+				Leechers:  int(item.Status.Leechers),
+			})
+		}
 		if len(data.Data) < params.PageSize {
 			break // short page: no more results to page through
 		}
-	}
-
-	var candidates []scheduler.Candidate
-	for _, item := range raw {
-		seeders := int(item.Status.Seeders)
-		leechers := int(item.Status.Leechers)
-
-		c.paceOther()
-		detail, err := c.GetTorrentDetail(ctx, string(item.ID))
-		if err != nil {
-			return nil, fmt.Errorf("resolving detail for torrent %s: %w", item.ID, err)
-		}
-
-		candidates = append(candidates, scheduler.Candidate{
-			TorrentID: string(item.ID),
-			InfoHash:  detail.InfoHash,
-			Seeders:   seeders,
-			Leechers:  leechers,
-		})
 	}
 
 	return candidates, nil
@@ -135,26 +110,6 @@ func (c *Client) GetDownloadToken(ctx context.Context, torrentID string) (string
 		return "", fmt.Errorf("decoding download token for torrent %s: %w", torrentID, err)
 	}
 	return token, nil
-}
-
-// GetTorrentDetail implements scheduler.Site. Callers that already paced
-// via paceOther (SearchHotTorrents) should not pace again; GetTorrentDetail
-// called directly paces itself.
-func (c *Client) GetTorrentDetail(ctx context.Context, torrentID string) (scheduler.Detail, error) {
-	req := detailRequest{ID: torrentID, Origin: "DETAIL"}
-	env, err := c.doJSON(ctx, "/api/torrent/detail", req)
-	if err != nil {
-		return scheduler.Detail{}, fmt.Errorf("getting detail for torrent %s: %w", torrentID, err)
-	}
-
-	var data detailResponseData
-	if err := json.Unmarshal(env.Data, &data); err != nil {
-		return scheduler.Detail{}, fmt.Errorf("decoding detail for torrent %s: %w", torrentID, err)
-	}
-	if data.InfoHash == "" {
-		return scheduler.Detail{}, fmt.Errorf("detail response for torrent %s did not contain infoHash", torrentID)
-	}
-	return scheduler.Detail{InfoHash: string(data.InfoHash)}, nil
 }
 
 // Fetch implements scheduler.TorrentFileFetcher. M-Team's genDlToken is

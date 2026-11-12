@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +26,9 @@ func baseParams() Params {
 
 // setupLanding wires a fakeSite + fakeFetcher + fakeTorrentFS so that
 // candidate c can be fully landed: GetDownloadToken, Fetch, and AddTorrent
-// all agree on a consistent token/bytes/infohash chain.
+// all agree on a consistent token/bytes/infohash chain. The .torrent for
+// site torrent id X resolves to infohash "hashX" — an identity only
+// torrentfs-go knows; the Candidate itself never carries it.
 func setupLanding(site *fakeSite, fetcher *fakeFetcher, tfs *fakeTorrentFS, c Candidate) {
 	token := "token-" + c.TorrentID
 	fileBytes := []byte("torrent-bytes-" + c.TorrentID)
@@ -40,14 +43,14 @@ func setupLanding(site *fakeSite, fetcher *fakeFetcher, tfs *fakeTorrentFS, c Ca
 	if tfs.infoHashByBytes == nil {
 		tfs.infoHashByBytes = map[string]string{}
 	}
-	tfs.infoHashByBytes[string(fileBytes)] = c.InfoHash
+	tfs.infoHashByBytes[string(fileBytes)] = "hash" + c.TorrentID
 }
 
 func TestScan_FillsEmptyPoolUpToPoolSize(t *testing.T) {
 	candidates := []Candidate{
-		{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100},
-		{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90},
-		{TorrentID: "C", InfoHash: "hashC", Seeders: 20, Leechers: 80},
+		{TorrentID: "A", Seeders: 20, Leechers: 100},
+		{TorrentID: "B", Seeders: 20, Leechers: 90},
+		{TorrentID: "C", Seeders: 20, Leechers: 80},
 	}
 	site := &fakeSite{candidates: candidates}
 	fetcher := &fakeFetcher{}
@@ -74,8 +77,8 @@ func TestScan_FillsEmptyPoolUpToPoolSize(t *testing.T) {
 
 func TestScan_SkipsCandidatesBelowThresholds(t *testing.T) {
 	candidates := []Candidate{
-		{TorrentID: "lowSeeders", InfoHash: "h1", Seeders: 5, Leechers: 100},  // seeders <= min
-		{TorrentID: "lowLeechers", InfoHash: "h2", Seeders: 20, Leechers: 10}, // leechers <= min
+		{TorrentID: "lowSeeders", Seeders: 5, Leechers: 100},  // seeders <= min
+		{TorrentID: "lowLeechers", Seeders: 20, Leechers: 10}, // leechers <= min
 	}
 	site := &fakeSite{candidates: candidates}
 	fetcher := &fakeFetcher{}
@@ -98,8 +101,8 @@ func TestScan_SkipsCandidatesBelowThresholds(t *testing.T) {
 }
 
 func TestScan_SkipsCandidateAlreadyInPool(t *testing.T) {
-	a := Candidate{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100}
-	b := Candidate{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90}
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
+	b := Candidate{TorrentID: "B", Seeders: 20, Leechers: 90}
 
 	site := &fakeSite{candidates: []Candidate{a}}
 	fetcher := &fakeFetcher{}
@@ -133,9 +136,9 @@ func TestScan_SkipsCandidateAlreadyInPool(t *testing.T) {
 }
 
 func TestScan_PoolFullNoColdMember_NoReplacement(t *testing.T) {
-	a := Candidate{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100}
-	b := Candidate{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90}
-	c := Candidate{TorrentID: "C", InfoHash: "hashC", Seeders: 20, Leechers: 80}
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
+	b := Candidate{TorrentID: "B", Seeders: 20, Leechers: 90}
+	c := Candidate{TorrentID: "C", Seeders: 20, Leechers: 80}
 
 	site := &fakeSite{candidates: []Candidate{a, b}}
 	fetcher := &fakeFetcher{}
@@ -174,9 +177,9 @@ func TestScan_PoolFullNoColdMember_NoReplacement(t *testing.T) {
 }
 
 func TestScan_PoolFullWithColdMember_ReplacesWorst(t *testing.T) {
-	a := Candidate{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100} // will go cold
-	b := Candidate{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90}  // stays active
-	c := Candidate{TorrentID: "C", InfoHash: "hashC", Seeders: 20, Leechers: 80}  // new candidate
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100} // will go cold
+	b := Candidate{TorrentID: "B", Seeders: 20, Leechers: 90}  // stays active
+	c := Candidate{TorrentID: "C", Seeders: 20, Leechers: 80}  // new candidate
 
 	site := &fakeSite{candidates: []Candidate{a, b}}
 	fetcher := &fakeFetcher{}
@@ -272,7 +275,7 @@ func findTorrentFSID(tfs *fakeTorrentFS, infoHash string) string {
 }
 
 func TestDetectColdTorrents_NewMemberWithinColdWindow_NotJudged(t *testing.T) {
-	a := Candidate{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100}
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
 	site := &fakeSite{candidates: []Candidate{a}}
 	fetcher := &fakeFetcher{}
 	tfs := newFakeTorrentFS()
@@ -306,7 +309,7 @@ func TestDetectColdTorrents_NewMemberWithinColdWindow_NotJudged(t *testing.T) {
 }
 
 func TestLand_RunsFixedSequenceWithConfiguredCategoryAndRange(t *testing.T) {
-	a := Candidate{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100}
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
 	var calls []string
 	site := &fakeSite{candidates: []Candidate{a}, calls: &calls}
 	fetcher := &fakeFetcher{calls: &calls}
@@ -355,8 +358,8 @@ func TestLand_RunsFixedSequenceWithConfiguredCategoryAndRange(t *testing.T) {
 func TestRebuildFromTorrentFS_FiltersByCategoryWithEmptySampleWindows(t *testing.T) {
 	tfs := newFakeTorrentFS()
 	tfs.infoHashByBytes["x"] = "hashMine" // unused helper state, harmless
-	tfs.entries["tfs-1"] = &fakeTorrentFSEntry{infoHash: "hashMine", category: "boost-mteam", uploadedBytes: 500}
-	tfs.entries["tfs-2"] = &fakeTorrentFSEntry{infoHash: "hashOther", category: "boost-othersite", uploadedBytes: 500}
+	tfs.entries["hashMine"] = &fakeTorrentFSEntry{infoHash: "hashMine", category: "boost-mteam", uploadedBytes: 500}
+	tfs.entries["hashOther"] = &fakeTorrentFSEntry{infoHash: "hashOther", category: "boost-othersite", uploadedBytes: 500}
 
 	params := baseParams()
 	params.Category = "boost-mteam"
@@ -388,6 +391,151 @@ func TestRebuildFromTorrentFS_FiltersByCategoryWithEmptySampleWindows(t *testing
 	}
 }
 
+// TestScan_AfterRestart_RecognizesRebuiltMemberViaIdempotentAdd covers the
+// "no state kept across restarts" design (ADR 0003): a rebuilt pool knows
+// its members only by torrentfs id, so the first scan re-adds a still-hot
+// candidate once, sees the returned id is already pooled, and leaves it
+// alone. From then on the in-process cache skips it without downloading.
+func TestScan_AfterRestart_RecognizesRebuiltMemberViaIdempotentAdd(t *testing.T) {
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
+	site := &fakeSite{candidates: []Candidate{a}}
+	fetcher := &fakeFetcher{}
+	tfs := newFakeTorrentFS()
+	setupLanding(site, fetcher, tfs, a)
+	tfs.entries["hashA"] = &fakeTorrentFSEntry{infoHash: "hashA", category: "boost-mteam"}
+
+	sched := New(site, tfs, fetcher, newFakeClock(time.Now()), baseParams())
+	if err := sched.RebuildFromTorrentFS(ctx); err != nil {
+		t.Fatalf("RebuildFromTorrentFS returned error: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := sched.Scan(ctx); err != nil {
+			t.Fatalf("Scan #%d returned error: %v", i+1, err)
+		}
+	}
+
+	if len(sched.Pool()) != 1 {
+		t.Fatalf("pool size = %d, want 1 (rebuilt member, not duplicated)", len(sched.Pool()))
+	}
+	if tfs.addTorrentCalls != 1 {
+		t.Errorf("AddTorrent called %d times, want 1 (once to resolve the id, then cached)", tfs.addTorrentCalls)
+	}
+	if len(tfs.setCategoryCalls) != 0 || len(tfs.triggerPieceDownloadLog) != 0 {
+		t.Errorf("an already-pooled member must not be re-landed: setCategory=%v pieceDownload=%v",
+			tfs.setCategoryCalls, tfs.triggerPieceDownloadLog)
+	}
+}
+
+// TestScan_DuplicateCandidateDoesNotEvictColdMember guards the add-before-
+// evict ordering: with a full pool and a cold member available, a
+// candidate that turns out to already be pooled must not cost that cold
+// member its slot.
+func TestScan_DuplicateCandidateDoesNotEvictColdMember(t *testing.T) {
+	a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
+	site := &fakeSite{candidates: []Candidate{a}}
+	fetcher := &fakeFetcher{}
+	tfs := newFakeTorrentFS()
+	setupLanding(site, fetcher, tfs, a)
+	tfs.entries["hashA"] = &fakeTorrentFSEntry{infoHash: "hashA", category: "boost-mteam"}
+	tfs.entries["hashCold"] = &fakeTorrentFSEntry{infoHash: "hashCold", category: "boost-mteam"}
+
+	sched := New(site, tfs, fetcher, newFakeClock(time.Now()), baseParams()) // PoolSize: 2
+	if err := sched.RebuildFromTorrentFS(ctx); err != nil {
+		t.Fatalf("RebuildFromTorrentFS returned error: %v", err)
+	}
+	sched.pool["hashCold"].cold = true
+
+	if err := sched.Scan(ctx); err != nil {
+		t.Fatalf("Scan returned error: %v", err)
+	}
+
+	if len(tfs.deleteTorrentCalls) != 0 {
+		t.Fatalf("DeleteTorrent calls = %v, want none (candidate was a duplicate)", tfs.deleteTorrentCalls)
+	}
+	if len(sched.Pool()) != 2 {
+		t.Fatalf("pool size = %d, want 2", len(sched.Pool()))
+	}
+}
+
+// TestScan_EvictFailureRollsBackAddedTorrent: the incoming torrent is added
+// before the cold member is evicted, so a failed eviction must delete it
+// again rather than leave an uncategorized orphan in torrentfs-go.
+func TestScan_EvictFailureRollsBackAddedTorrent(t *testing.T) {
+	c := Candidate{TorrentID: "C", Seeders: 20, Leechers: 80}
+	site := &fakeSite{candidates: []Candidate{c}}
+	fetcher := &fakeFetcher{}
+	tfs := newFakeTorrentFS()
+	setupLanding(site, fetcher, tfs, c)
+	tfs.entries["hashA"] = &fakeTorrentFSEntry{infoHash: "hashA", category: "boost-mteam"}
+	tfs.entries["hashB"] = &fakeTorrentFSEntry{infoHash: "hashB", category: "boost-mteam"}
+	tfs.deleteErr = errors.New("torrentfs-go unavailable")
+
+	sched := New(site, tfs, fetcher, newFakeClock(time.Now()), baseParams()) // PoolSize: 2
+	if err := sched.RebuildFromTorrentFS(ctx); err != nil {
+		t.Fatalf("RebuildFromTorrentFS returned error: %v", err)
+	}
+	sched.pool["hashA"].cold = true
+
+	if err := sched.Scan(ctx); err == nil {
+		t.Fatal("Scan: want error when eviction fails, got nil")
+	}
+
+	want := []string{"hashA", "hashC"} // failed eviction, then rollback of the incoming torrent
+	if len(tfs.deleteTorrentCalls) != 2 || tfs.deleteTorrentCalls[0] != want[0] || tfs.deleteTorrentCalls[1] != want[1] {
+		t.Fatalf("DeleteTorrent calls = %v, want %v", tfs.deleteTorrentCalls, want)
+	}
+	if len(tfs.setCategoryCalls) != 0 {
+		t.Errorf("incoming torrent must not be categorized when eviction failed, got %v", tfs.setCategoryCalls)
+	}
+	pool := sched.Pool()
+	if len(pool) != 2 {
+		t.Fatalf("pool size = %d, want 2 (unchanged)", len(pool))
+	}
+	for _, m := range pool {
+		if m.TorrentFSID == "hashC" {
+			t.Errorf("incoming torrent must not be in the pool after a failed eviction")
+		}
+	}
+}
+
+// TestScan_PreexistingForeignTorrentIsLeftAlone: AddTorrent being
+// idempotent means a candidate can resolve to a torrent torrentfs-go
+// already manages for someone else — the user's own library (no category)
+// or another site's pool. Scheduler must not re-tag it, pool it (which
+// would later get it deleted as a cold member), evict for it, or delete
+// it.
+func TestScan_PreexistingForeignTorrentIsLeftAlone(t *testing.T) {
+	for _, category := range []string{"", "boost-othersite"} {
+		t.Run("category="+category, func(t *testing.T) {
+			a := Candidate{TorrentID: "A", Seeders: 20, Leechers: 100}
+			site := &fakeSite{candidates: []Candidate{a}}
+			fetcher := &fakeFetcher{}
+			tfs := newFakeTorrentFS()
+			setupLanding(site, fetcher, tfs, a)
+			tfs.entries["hashA"] = &fakeTorrentFSEntry{infoHash: "hashA", category: category}
+
+			sched := New(site, tfs, fetcher, newFakeClock(time.Now()), baseParams())
+			if err := sched.Scan(ctx); err != nil {
+				t.Fatalf("Scan returned error: %v", err)
+			}
+
+			if len(sched.Pool()) != 0 {
+				t.Fatalf("pool size = %d, want 0", len(sched.Pool()))
+			}
+			if got := tfs.entries["hashA"].category; got != category {
+				t.Errorf("category = %q, want it left as %q", got, category)
+			}
+			if len(tfs.triggerPieceDownloadLog) != 0 {
+				t.Errorf("TriggerPieceDownload calls = %v, want none", tfs.triggerPieceDownloadLog)
+			}
+			if len(tfs.deleteTorrentCalls) != 0 {
+				t.Errorf("DeleteTorrent calls = %v, want none", tfs.deleteTorrentCalls)
+			}
+		})
+	}
+}
+
 // TestConcurrentScanAndDetectColdTorrents_NoDataRace guards the mutex
 // added to Scheduler for issue #7: in production, Runner (internal/app)
 // drives Scan and DetectColdTorrents for the same Scheduler from two
@@ -400,8 +548,8 @@ func TestRebuildFromTorrentFS_FiltersByCategoryWithEmptySampleWindows(t *testing
 // deadlock/panic, not that it's race-free.
 func TestConcurrentScanAndDetectColdTorrents_NoDataRace(t *testing.T) {
 	candidates := []Candidate{
-		{TorrentID: "A", InfoHash: "hashA", Seeders: 20, Leechers: 100},
-		{TorrentID: "B", InfoHash: "hashB", Seeders: 20, Leechers: 90},
+		{TorrentID: "A", Seeders: 20, Leechers: 100},
+		{TorrentID: "B", Seeders: 20, Leechers: 90},
 	}
 	site := &fakeSite{candidates: candidates}
 	fetcher := &fakeFetcher{}
@@ -442,4 +590,33 @@ func TestConcurrentScanAndDetectColdTorrents_NoDataRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestDetectColdTorrents_JitteredTicksStillReachFullWindow guards against a
+// pruning off-by-one found against a real clock: ticks never land exactly
+// ColdWindow apart, so the one sample just older than the cutoff must be
+// kept as the window's anchor. Dropping it left the span permanently short
+// of ColdWindow and no member was ever judged cold.
+func TestDetectColdTorrents_JitteredTicksStillReachFullWindow(t *testing.T) {
+	tfs := newFakeTorrentFS()
+	tfs.entries["hashA"] = &fakeTorrentFSEntry{infoHash: "hashA", category: "boost-mteam"}
+	clock := newFakeClock(time.Now())
+	params := baseParams()
+	sched := New(&fakeSite{}, tfs, &fakeFetcher{}, clock, params)
+	if err := sched.RebuildFromTorrentFS(ctx); err != nil {
+		t.Fatalf("RebuildFromTorrentFS returned error: %v", err)
+	}
+
+	tick := params.ColdWindow/10 + 137*time.Millisecond // never divides ColdWindow evenly
+	for i := 0; i < 15; i++ {
+		if err := sched.DetectColdTorrents(ctx); err != nil {
+			t.Fatalf("DetectColdTorrents returned error: %v", err)
+		}
+		clock.Advance(tick)
+	}
+
+	pool := sched.Pool()
+	if len(pool) != 1 || !pool[0].Cold {
+		t.Fatalf("pool = %+v, want the idle member judged cold after more than a full ColdWindow of samples", pool)
+	}
 }

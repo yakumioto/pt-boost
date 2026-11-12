@@ -105,7 +105,13 @@ type Scheduler struct {
 	// check. Acceptable for v1; revisit if it becomes a real problem.
 	mu sync.Mutex
 
-	pool       map[string]*member // keyed by InfoHash
+	pool map[string]*member // keyed by torrentfs-go id
+	// knownIDs caches site torrent id -> torrentfs-go id for every
+	// candidate this process has added, so a steady-state scan does not
+	// re-download the .torrent of members it already pooled. In-memory
+	// only: after a restart it starts empty and each still-hot member
+	// costs one extra download + idempotent add (ADR 0003).
+	knownIDs   map[string]string
 	lastScanAt time.Time
 }
 
@@ -132,6 +138,7 @@ func New(site Site, torrentFS TorrentFSClient, fetcher TorrentFileFetcher, clock
 		params:    params,
 		logger:    slog.Default(),
 		pool:      make(map[string]*member),
+		knownIDs:  make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -197,7 +204,7 @@ func (s *Scheduler) RebuildFromTorrentFS(ctx context.Context) error {
 		if v.Category != s.params.Category {
 			continue
 		}
-		s.pool[v.InfoHash] = &member{
+		s.pool[v.ID] = &member{
 			infoHash:    v.InfoHash,
 			torrentFSID: v.ID,
 			joinedAt:    now,
@@ -212,9 +219,17 @@ func (s *Scheduler) RebuildFromTorrentFS(ctx context.Context) error {
 }
 
 // Scan runs one scan-loop tick: search for candidates, filter out anything
-// below threshold or already pooled, then either fill the pool (if it has
-// room) or replace the worst currently-cold member with the best new
-// candidate (if the pool is full and a cold member exists).
+// below threshold or already known to be pooled, then either fill the pool
+// (if it has room) or replace the worst currently-cold member with the
+// best new candidate (if the pool is full and a cold member exists).
+//
+// A candidate carries no infohash, so "is it already pooled?" is answered
+// in two layers (ADR 0003): the in-process knownIDs cache (site torrent id
+// -> torrentfs-go id) short-circuits candidates this process has already
+// added, and anything else is added to torrentfs-go first — an idempotent
+// call — so the returned id can be checked against the pool. That is why
+// add happens before evict: a duplicate candidate must never cost a cold
+// member its slot.
 func (s *Scheduler) Scan(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,11 +250,16 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 		"pool_capacity", s.params.PoolSize,
 	)
 
+	// preexisting is torrentfs-go's id -> category snapshot, fetched
+	// lazily right before this round's first add. It tells a torrent
+	// this round's AddTorrent created apart from one that was already
+	// there (and possibly owned by someone else).
+	var preexisting map[string]string
+
 	for _, c := range candidates {
 		if c.Seeders <= s.params.SeedersMin || c.Leechers <= s.params.LeechersMin {
 			s.logger.Debug("candidate below thresholds, skipped",
 				"torrent_id", c.TorrentID,
-				"info_hash", c.InfoHash,
 				"seeders", c.Seeders,
 				"leechers", c.Leechers,
 				"seeders_min", s.params.SeedersMin,
@@ -247,40 +267,81 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 			)
 			continue
 		}
-		if _, alreadyPooled := s.pool[c.InfoHash]; alreadyPooled {
-			s.logger.Debug("candidate already in pool, skipped",
-				"torrent_id", c.TorrentID, "info_hash", c.InfoHash)
-			continue
-		}
-
-		if len(s.pool) < s.params.PoolSize {
-			if err := s.land(ctx, c); err != nil {
-				return fmt.Errorf("landing candidate %s: %w", c.TorrentID, err)
+		if id, known := s.knownIDs[c.TorrentID]; known {
+			if _, pooled := s.pool[id]; pooled {
+				s.logger.Debug("candidate already in pool, skipped",
+					"torrent_id", c.TorrentID, "torrentfs_id", id)
+				continue
 			}
-			continue
 		}
 
-		worst := s.worstColdMember()
-		if worst == nil {
-			// Pool full, no cold member to replace: this round does
-			// nothing further (design-overview.md §1.5).
-			s.logger.Debug("pool full and no cold member, candidate not landed",
-				"torrent_id", c.TorrentID, "info_hash", c.InfoHash)
-			continue
+		var worst *member
+		if len(s.pool) >= s.params.PoolSize {
+			worst = s.worstColdMember()
+			if worst == nil {
+				// Pool full, no cold member to replace: this round
+				// does nothing further (design-overview.md §1.5), so
+				// no .torrent is downloaded for this candidate.
+				s.logger.Debug("pool full and no cold member, candidate not landed",
+					"torrent_id", c.TorrentID)
+				continue
+			}
 		}
-		s.logger.Info("replacing cold pool member",
-			"cold_info_hash", worst.infoHash,
-			"cold_torrentfs_id", worst.torrentFSID,
-			"cold_last_rate_bytes_per_second", worst.lastRateBytes,
-			"incoming_torrent_id", c.TorrentID,
-			"incoming_info_hash", c.InfoHash,
-		)
-		if err := s.evict(ctx, worst); err != nil {
-			return fmt.Errorf("evicting cold member %s: %w", worst.infoHash, err)
+
+		if preexisting == nil {
+			views, err := s.torrentFS.ListTorrents(ctx)
+			if err != nil {
+				return fmt.Errorf("listing torrents before landing: %w", err)
+			}
+			preexisting = make(map[string]string, len(views))
+			for _, v := range views {
+				preexisting[v.ID] = v.Category
+			}
 		}
-		if err := s.land(ctx, c); err != nil {
+
+		id, err := s.add(ctx, c)
+		if err != nil {
 			return fmt.Errorf("landing candidate %s: %w", c.TorrentID, err)
 		}
+		s.knownIDs[c.TorrentID] = id
+
+		if _, pooled := s.pool[id]; pooled {
+			// Idempotent re-add of a member this process didn't know
+			// the site id for (typically: first scan after a restart).
+			s.logger.Debug("candidate resolved to an existing pool member, skipped",
+				"torrent_id", c.TorrentID, "torrentfs_id", id)
+			continue
+		}
+		if category, existed := preexisting[id]; existed {
+			// torrentfs-go already managed this torrent before this
+			// round and it is not a pool member, so it is someone
+			// else's: the user's own library (typically with no
+			// category at all) or another site's pool. Never re-tag,
+			// evict for, or delete it — pooling it would eventually
+			// get it deleted as a cold member.
+			s.logger.Info("candidate already managed outside this pool, skipped",
+				"torrent_id", c.TorrentID, "torrentfs_id", id, "category", category)
+			continue
+		}
+
+		if worst != nil {
+			s.logger.Info("replacing cold pool member",
+				"cold_torrentfs_id", worst.torrentFSID,
+				"cold_last_rate_bytes_per_second", worst.lastRateBytes,
+				"incoming_torrent_id", c.TorrentID,
+				"incoming_torrentfs_id", id,
+			)
+			if err := s.evict(ctx, worst); err != nil {
+				// Safe to delete: id was not in preexisting, so this
+				// round's add created it.
+				s.rollbackAdd(ctx, c, id)
+				return fmt.Errorf("evicting cold member %s: %w", worst.torrentFSID, err)
+			}
+		}
+		if err := s.activate(ctx, c, id); err != nil {
+			return fmt.Errorf("landing candidate %s: %w", c.TorrentID, err)
+		}
+		preexisting[id] = s.params.Category
 	}
 
 	return nil
@@ -301,15 +362,14 @@ func (s *Scheduler) worstColdMember() *member {
 	return worst
 }
 
-// land runs the fixed four-step landing sequence (design-overview.md §3):
-// download token -> fetch .torrent bytes -> add to torrentfs-go -> set
-// category -> trigger piece download covering TargetShareBytes from byte
-// 0. Any failure mid-sequence aborts this candidate for the round; it is
-// not retried or rolled back here (see ticket Out of Scope: no saga).
-func (s *Scheduler) land(ctx context.Context, c Candidate) error {
+// add runs the first half of the landing sequence (design-overview.md §3):
+// download token -> fetch .torrent bytes -> add to torrentfs-go. It
+// returns torrentfs-go's id for the torrent, which is the only identity
+// Scheduler ever has for it. The torrent is not a pool member yet: it has
+// no category until activate runs.
+func (s *Scheduler) add(ctx context.Context, c Candidate) (string, error) {
 	s.logger.Info("landing candidate",
 		"torrent_id", c.TorrentID,
-		"info_hash", c.InfoHash,
 		"seeders", c.Seeders,
 		"leechers", c.Leechers,
 		"category", s.params.Category,
@@ -317,24 +377,31 @@ func (s *Scheduler) land(ctx context.Context, c Candidate) error {
 
 	token, err := s.site.GetDownloadToken(ctx, c.TorrentID)
 	if err != nil {
-		return fmt.Errorf("getting download token: %w", err)
+		return "", fmt.Errorf("getting download token: %w", err)
 	}
 	s.logger.Debug("landing step: got download token", "torrent_id", c.TorrentID)
 
 	torrentBytes, err := s.fetcher.Fetch(ctx, token)
 	if err != nil {
-		return fmt.Errorf("fetching .torrent bytes: %w", err)
+		return "", fmt.Errorf("fetching .torrent bytes: %w", err)
 	}
 	s.logger.Debug("landing step: fetched .torrent bytes",
 		"torrent_id", c.TorrentID, "bytes", len(torrentBytes))
 
 	id, err := s.torrentFS.AddTorrent(ctx, torrentBytes)
 	if err != nil {
-		return fmt.Errorf("adding torrent to torrentfs-go: %w", err)
+		return "", fmt.Errorf("adding torrent to torrentfs-go: %w", err)
 	}
 	s.logger.Debug("landing step: added torrent to torrentfs-go",
 		"torrent_id", c.TorrentID, "torrentfs_id", id)
+	return id, nil
+}
 
+// activate runs the second half of the landing sequence: set category ->
+// trigger piece download covering TargetShareBytes from byte 0 -> record
+// the pool member. Any failure mid-sequence aborts this candidate for the
+// round; it is not rolled back here (see ticket Out of Scope: no saga).
+func (s *Scheduler) activate(ctx context.Context, c Candidate, id string) error {
 	if err := s.torrentFS.SetCategory(ctx, id, s.params.Category); err != nil {
 		return fmt.Errorf("setting category: %w", err)
 	}
@@ -348,19 +415,34 @@ func (s *Scheduler) land(ctx context.Context, c Candidate) error {
 	s.logger.Debug("landing step: triggered piece download",
 		"torrent_id", c.TorrentID, "torrentfs_id", id, "offset", 0, "length", length)
 
-	s.pool[c.InfoHash] = &member{
-		infoHash:    c.InfoHash,
+	s.pool[id] = &member{
+		// torrentfs-go's id is the infohash (ADR 0003).
+		infoHash:    id,
 		torrentFSID: id,
 		joinedAt:    s.clock.Now(),
 	}
 	s.logger.Info("candidate landed into pool",
 		"torrent_id", c.TorrentID,
-		"info_hash", c.InfoHash,
 		"torrentfs_id", id,
 		"pool_size", len(s.pool),
 		"pool_capacity", s.params.PoolSize,
 	)
 	return nil
+}
+
+// rollbackAdd removes a torrent this round's add created but could not
+// make room for, so a failed eviction does not leave an uncategorized
+// orphan behind in torrentfs-go. Best effort: a failure here is only
+// logged, since the caller is already returning the eviction error.
+func (s *Scheduler) rollbackAdd(ctx context.Context, c Candidate, id string) {
+	delete(s.knownIDs, c.TorrentID)
+	if _, err := s.torrentFS.DeleteTorrent(ctx, id); err != nil {
+		s.logger.Warn("rolling back added torrent failed; uncategorized torrent left in torrentfs-go",
+			"torrent_id", c.TorrentID, "torrentfs_id", id, "error", err)
+		return
+	}
+	s.logger.Info("rolled back added torrent after failed eviction",
+		"torrent_id", c.TorrentID, "torrentfs_id", id)
 }
 
 // evict removes a member from torrentfs-go and drops it (and its sample
@@ -370,9 +452,8 @@ func (s *Scheduler) evict(ctx context.Context, m *member) error {
 	if err != nil {
 		return fmt.Errorf("deleting torrent: %w", err)
 	}
-	delete(s.pool, m.infoHash)
+	delete(s.pool, m.torrentFSID)
 	s.logger.Info("cold member evicted from pool",
-		"info_hash", m.infoHash,
 		"torrentfs_id", m.torrentFSID,
 		"last_rate_bytes_per_second", m.lastRateBytes,
 		"operation_id", operationID,
@@ -398,12 +479,12 @@ func (s *Scheduler) DetectColdTorrents(ctx context.Context) error {
 
 	uploaded := make(map[string]int64, len(views))
 	for _, v := range views {
-		uploaded[v.InfoHash] = v.UploadedBytes
+		uploaded[v.ID] = v.UploadedBytes
 	}
 
 	now := s.clock.Now()
-	for infoHash, m := range s.pool {
-		bytes, ok := uploaded[infoHash]
+	for id, m := range s.pool {
+		bytes, ok := uploaded[id]
 		if !ok {
 			// torrentfs-go no longer reports this torrent; leave its last
 			// known cold/rate state untouched rather than guessing.
@@ -436,7 +517,6 @@ func (s *Scheduler) DetectColdTorrents(ctx context.Context) error {
 		m.cold = rate < s.params.ColdRateThreshold
 		if wasCold != m.cold {
 			s.logger.Info("pool member cold verdict changed",
-				"info_hash", infoHash,
 				"torrentfs_id", m.torrentFSID,
 				"cold", m.cold,
 				"rate_bytes_per_second", rate,
@@ -457,7 +537,9 @@ func pruneBefore(samples []sample, cutoff time.Time) []sample {
 	}
 	// Keep one sample before the cutoff (if any) so the window has an
 	// "oldest" point at or before cutoff to measure the full span from.
-	if i > 1 {
+	// Without it, a steadily ticking detector drops each sample the moment
+	// it ages past the cutoff and the span never reaches ColdWindow.
+	if i > 0 {
 		i--
 	}
 	return samples[i:]

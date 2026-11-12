@@ -7,7 +7,7 @@
 // M-Team has no published OpenAPI response schema for third-party
 // consumption (the upstream guide this adapter was built from documents
 // *request* parameters in detail but not the exact *response* field names);
-// this package's envelope/searchResultItem/detailResponseData types are
+// this package's envelope/searchResultItem types are
 // this adapter's best-effort understanding, cross-checked against public
 // M-Team API client implementations. If a real M-Team instance's response
 // shape differs, that is an integration risk to re-verify against a live

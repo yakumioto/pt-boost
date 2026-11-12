@@ -11,23 +11,17 @@ import (
 	"time"
 )
 
-// Candidate is one hot-torrent search result from a PT site, already known
-// to carry enough identity to dedupe against the current pool (InfoHash)
-// and to land later (TorrentID, the site's own identifier used to fetch a
-// download token).
+// Candidate is one hot-torrent search result from a PT site. It carries
+// only the site's own identifier (TorrentID, used to fetch a download
+// token) plus the swarm counts Scan filters on. It deliberately has no
+// InfoHash: PT sites are not required to expose one (M-Team's API returns
+// null for it), and Scheduler never needs it up front — a candidate's
+// cross-system identity is whatever id torrentfs-go reports when its
+// .torrent is added (see TorrentFSClient.AddTorrent and ADR 0003).
 type Candidate struct {
 	TorrentID string
-	InfoHash  string
 	Seeders   int
 	Leechers  int
-}
-
-// Detail is the richer per-torrent information a Site can report. In v1 the
-// scheduler only ever needs InfoHash from it (as a fallback identity source
-// for adapters whose search results don't carry one directly), but the
-// interface leaves room for more without changing its shape.
-type Detail struct {
-	InfoHash string
 }
 
 // SearchParams bounds one PT-site search round. A Site implementation owns
@@ -50,8 +44,6 @@ type Site interface {
 	// token (for M-Team, a signed URL) that TorrentFileFetcher can turn
 	// into the raw .torrent bytes.
 	GetDownloadToken(ctx context.Context, torrentID string) (string, error)
-	// GetTorrentDetail fetches richer per-torrent information.
-	GetTorrentDetail(ctx context.Context, torrentID string) (Detail, error)
 }
 
 // TorrentFileFetcher turns a download token (as returned by
@@ -86,9 +78,10 @@ type ByteRange struct {
 }
 
 // TorrentView is torrentfs-go's view of one torrent it is managing, as
-// reported by ListTorrents. InfoHash is the cross-system identity shared
-// with Candidate; Category is the local category tag (see GLOSSARY.md "本地
-// 分类标签") pt-boost uses to recognize its own pool members.
+// reported by ListTorrents. ID is the identity Scheduler keys its pool on
+// (the same id AddTorrent returns); Category is the local category tag
+// (see GLOSSARY.md "本地分类标签") pt-boost uses to recognize its own pool
+// members.
 type TorrentView struct {
 	ID            string
 	InfoHash      string
@@ -109,7 +102,12 @@ type OperationStatus struct {
 // an implementation detail hidden behind this interface.
 type TorrentFSClient interface {
 	// AddTorrent uploads raw .torrent bytes and returns torrentfs-go's
-	// internal id for it.
+	// id for it. Scheduler relies on two properties of torrentfs-go here
+	// (see ADR 0003): the call is idempotent — re-adding a torrent it
+	// already manages succeeds and returns the same id — and the id is
+	// stable per torrent content (torrentfs-go uses the infohash). That
+	// is what lets Scheduler recognize an already-pooled candidate
+	// without ever computing an infohash itself.
 	AddTorrent(ctx context.Context, torrentBytes []byte) (id string, err error)
 	// SetCategory tags a torrent with pt-boost's local category (see
 	// GLOSSARY.md "本地分类标签"): the sole membership marker used to
