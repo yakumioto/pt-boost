@@ -14,16 +14,15 @@ import (
 )
 
 // fakeServer simulates this adapter's assumed understanding of M-Team's
-// /api/torrent/search, /api/torrent/genDlToken, and /api/torrent/detail
-// contract (see package doc: unverified against an official schema).
+// /api/torrent/search and /api/torrent/genDlToken contract (see package
+// doc: unverified against an official schema). /api/torrent/detail is
+// registered only to count calls: the adapter must never hit it.
 type fakeServer struct {
 	mu sync.Mutex
 
 	searchPages    [][]searchResultItem // page N served for request N (1-indexed)
 	searchRequests []searchRequest
 
-	detailInfoHash  map[string]string // torrentID -> infoHash, "" means omit the field
-	detailRequests  []detailRequest
 	detailCallCount int
 
 	tokenRequests []string // raw "id" form values seen by genDlToken
@@ -36,8 +35,7 @@ type fakeServer struct {
 
 func newFakeServer() *fakeServer {
 	return &fakeServer{
-		detailInfoHash: map[string]string{},
-		torrentBytes:   map[string][]byte{},
+		torrentBytes: map[string][]byte{},
 	}
 }
 
@@ -97,19 +95,10 @@ func (f *fakeServer) handleGenDlToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeServer) handleDetail(w http.ResponseWriter, r *http.Request) {
-	var req detailRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	f.mu.Lock()
-	f.detailRequests = append(f.detailRequests, req)
 	f.detailCallCount++
-	hash := f.detailInfoHash[req.ID]
 	f.mu.Unlock()
-
-	writeEnvelope(w, detailResponseData{InfoHash: flexString(hash)})
+	http.Error(w, "detail must not be called", http.StatusGone)
 }
 
 func (f *fakeServer) handleFetch(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +149,6 @@ func TestSearchHotTorrents_PaginatesAndStopsOnShortPage(t *testing.T) {
 		{item("1", 20, 100), item("2", 20, 100)}, // full page (pageSize=2)
 		{item("3", 20, 100)},                     // short page: stop here
 	}
-	fs.detailInfoHash = map[string]string{"1": "hash1", "2": "hash2", "3": "hash3"}
 
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
@@ -209,13 +197,12 @@ func TestSearchHotTorrents_SendsAllModeAndLeechersDescSort(t *testing.T) {
 // threshold filtering of its own — pool-membership thresholds are
 // scheduler.Scheduler.Scan's sole responsibility (it re-applies them
 // independently). Even a candidate with very low seeders/leechers must
-// still get its InfoHash resolved via GetTorrentDetail and be returned.
+// still be returned.
 func TestSearchHotTorrents_ReturnsRawCandidatesWithoutFilteringByThreshold(t *testing.T) {
 	fs := newFakeServer()
 	fs.searchPages = [][]searchResultItem{{
 		item("barely-alive", 1, 1), // would fail any sane threshold
 	}}
-	fs.detailInfoHash = map[string]string{"barely-alive": "hash-low"}
 
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
@@ -232,15 +219,15 @@ func TestSearchHotTorrents_ReturnsRawCandidatesWithoutFilteringByThreshold(t *te
 	if got.TorrentID != "barely-alive" || got.Seeders != 1 || got.Leechers != 1 {
 		t.Fatalf("got %+v, want the low-seeders/leechers candidate returned as-is", got)
 	}
-	if fs.detailCallCount != 1 {
-		t.Fatalf("detail called %d times, want 1 (detail must be resolved for every raw candidate)", fs.detailCallCount)
-	}
 }
 
-func TestSearchHotTorrents_ResolvesInfoHashViaDetail(t *testing.T) {
+// TestSearchHotTorrents_OnlyCallsSearch guards ADR 0003: candidates are
+// identified by M-Team's torrent id alone, so searching must cost exactly
+// the search pages — no per-candidate /api/torrent/detail lookup (its
+// infoHash is null in production) and no .torrent download.
+func TestSearchHotTorrents_OnlyCallsSearch(t *testing.T) {
 	fs := newFakeServer()
-	fs.searchPages = [][]searchResultItem{{item("42", 20, 100)}}
-	fs.detailInfoHash = map[string]string{"42": "abc123infohash"}
+	fs.searchPages = [][]searchResultItem{{item("42", 20, 100), item("43", 30, 90)}}
 
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
@@ -250,14 +237,23 @@ func TestSearchHotTorrents_ResolvesInfoHashViaDetail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchHotTorrents: %v", err)
 	}
-	if len(candidates) != 1 {
-		t.Fatalf("got %d candidates, want 1", len(candidates))
+	want := []scheduler.Candidate{
+		{TorrentID: "42", Seeders: 20, Leechers: 100},
+		{TorrentID: "43", Seeders: 30, Leechers: 90},
 	}
-	if candidates[0].InfoHash != "abc123infohash" {
-		t.Errorf("InfoHash = %q, want %q", candidates[0].InfoHash, "abc123infohash")
+	if len(candidates) != len(want) {
+		t.Fatalf("got %d candidates, want %d", len(candidates), len(want))
 	}
-	if fs.detailRequests[0].Origin != "DETAIL" {
-		t.Errorf("detail request Origin = %q, want DETAIL", fs.detailRequests[0].Origin)
+	for i := range want {
+		if candidates[i] != want[i] {
+			t.Errorf("candidate[%d] = %+v, want %+v", i, candidates[i], want[i])
+		}
+	}
+	if fs.detailCallCount != 0 {
+		t.Errorf("detail called %d times, want 0", fs.detailCallCount)
+	}
+	if len(fs.tokenRequests) != 0 {
+		t.Errorf("genDlToken called for %v during search, want no calls", fs.tokenRequests)
 	}
 }
 
@@ -303,7 +299,6 @@ func TestSearchHotTorrents_PacesBetweenSearchPages(t *testing.T) {
 		{item("1", 20, 100)},
 		{item("2", 20, 100)},
 	}
-	fs.detailInfoHash = map[string]string{"1": "h1", "2": "h2"}
 
 	srv := httptest.NewServer(fs.handler())
 	defer srv.Close()
@@ -343,19 +338,6 @@ func TestGetDownloadToken_SendsFormUrlEncoded(t *testing.T) {
 	}
 	if len(fs.tokenRequests) != 1 || fs.tokenRequests[0] != "99" {
 		t.Errorf("server saw id requests %v, want [\"99\"]", fs.tokenRequests)
-	}
-}
-
-func TestGetTorrentDetail_MissingInfoHashReturnsError(t *testing.T) {
-	fs := newFakeServer()
-	fs.detailInfoHash = map[string]string{} // "7" omitted -> empty infoHash
-	srv := httptest.NewServer(fs.handler())
-	defer srv.Close()
-
-	c := newTestClient(t, srv)
-	_, err := c.GetTorrentDetail(context.Background(), "7")
-	if err == nil {
-		t.Fatal("GetTorrentDetail: want error for missing infoHash, got nil")
 	}
 }
 
@@ -414,7 +396,6 @@ func TestFetch_RelativeTokenResolvedAgainstBaseURL(t *testing.T) {
 func TestEndToEnd_SearchThenTokenThenFetch(t *testing.T) {
 	fs := newFakeServer()
 	fs.searchPages = [][]searchResultItem{{item("55", 20, 100)}}
-	fs.detailInfoHash = map[string]string{"55": "hash55"}
 	fs.torrentBytes["55"] = []byte("torrent-file-contents")
 
 	srv := httptest.NewServer(fs.handler())

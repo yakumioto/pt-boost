@@ -7,6 +7,13 @@
 // service (see docs/design-overview.md "范围边界"): this client only calls
 // the handful of /api/v1 endpoints the scheduler actually needs and never
 // reads or depends on torrentfs-go's own deployment configuration.
+//
+// The wire contract encoded here was verified against a running
+// torrentfs-go instance (and its source at commit 5936439), not inferred:
+// login takes a password only, a category must exist before a torrent can
+// be tagged with it, piece-download takes piece-index ranges rather than
+// byte offsets, and operations report a lifecycle state rather than a
+// done flag.
 package torrentfs
 
 import (
@@ -48,6 +55,10 @@ type Client struct {
 	mu              sync.Mutex
 	token           string
 	tokenObtainedAt time.Time
+	// ensuredCategories records categories this client has already made
+	// sure exist in torrentfs-go, so SetCategory creates each one at
+	// most once per process.
+	ensuredCategories map[string]bool
 }
 
 // Option configures optional Client behaviour.
@@ -72,6 +83,10 @@ func withNow(now func() time.Time) Option {
 }
 
 // New constructs a Client for the torrentfs-go instance at baseURL.
+//
+// torrentfs-go's login is password-only: its handler rejects any body
+// carrying a field other than "password". username is therefore kept for
+// configuration compatibility but never sent.
 func New(baseURL, username, password string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -80,6 +95,8 @@ func New(baseURL, username, password string, opts ...Option) *Client {
 		httpClient: http.DefaultClient,
 		tokenTTL:   defaultTokenTTL,
 		now:        time.Now,
+
+		ensuredCategories: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -108,8 +125,10 @@ func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	return c.token, nil
 }
 
+// loginRequest is the whole login body. torrentfs-go decodes it with
+// DisallowUnknownFields, so adding any other field (e.g. a username) makes
+// every login fail with 400 "invalid JSON body".
 type loginRequest struct {
-	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
@@ -118,7 +137,7 @@ type loginResponse struct {
 }
 
 func (c *Client) login(ctx context.Context) (string, error) {
-	body, err := json.Marshal(loginRequest{Username: c.username, Password: c.password})
+	body, err := json.Marshal(loginRequest{Password: c.password})
 	if err != nil {
 		return "", fmt.Errorf("encoding login request: %w", err)
 	}
@@ -256,8 +275,13 @@ type setCategoryRequest struct {
 }
 
 // SetCategory tags a torrent with pt-boost's local category (see
-// GLOSSARY.md "本地分类标签").
+// GLOSSARY.md "本地分类标签"). torrentfs-go only accepts categories that
+// already exist (an unknown one is a 404), so the category is created
+// first if this client has not yet seen it.
 func (c *Client) SetCategory(ctx context.Context, id, category string) error {
+	if err := c.ensureCategory(ctx, category); err != nil {
+		return err
+	}
 	body, err := json.Marshal(setCategoryRequest{Category: category})
 	if err != nil {
 		return fmt.Errorf("encoding set-category request: %w", err)
@@ -270,15 +294,72 @@ func (c *Client) SetCategory(ctx context.Context, id, category string) error {
 	return checkStatus(resp, "setting category")
 }
 
-type pieceDownloadRequest struct {
-	Offset int64 `json:"offset"`
-	Length int64 `json:"length"`
+type createCategoryRequest struct {
+	Name string `json:"name"`
 }
 
-// TriggerPieceDownload issues PUT .../piece-download for the given byte
-// range (see GLOSSARY.md "主动取片").
+// ensureCategory creates category in torrentfs-go unless this client
+// already knows it exists. 409 means it was already there (created by an
+// earlier run, or by hand), which is just as good as 201.
+func (c *Client) ensureCategory(ctx context.Context, category string) error {
+	c.mu.Lock()
+	known := c.ensuredCategories[category]
+	c.mu.Unlock()
+	if known {
+		return nil
+	}
+
+	body, err := json.Marshal(createCategoryRequest{Name: category})
+	if err != nil {
+		return fmt.Errorf("encoding create-category request: %w", err)
+	}
+	resp, err := c.authedRequest(ctx, http.MethodPost, "/api/v1/categories", body, "application/json")
+	if err != nil {
+		return fmt.Errorf("creating category: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("creating category %q failed with status %d: %s", category, resp.StatusCode, respBody)
+	}
+
+	c.mu.Lock()
+	c.ensuredCategories[category] = true
+	c.mu.Unlock()
+	return nil
+}
+
+// pieceRange is a half-open [Start, End) range of piece indices.
+type pieceRange struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+type pieceDownloadRequest struct {
+	Ranges []pieceRange `json:"ranges"`
+}
+
+// torrentStatusResponse is the subset of GET .../status needed to turn a
+// byte range into piece indices.
+type torrentStatusResponse struct {
+	Torrent struct {
+		TotalBytes int64 `json:"total_bytes"`
+	} `json:"torrent"`
+	PieceLength int64 `json:"piece_length"`
+}
+
+// TriggerPieceDownload issues PUT .../piece-download covering the given
+// byte range (see GLOSSARY.md "主动取片"). torrentfs-go addresses piece
+// downloads by piece index, not byte offset, and rejects a range reaching
+// past the last piece, so the torrent's piece length and size are looked
+// up first and the byte range is widened to whole pieces and clamped to
+// the torrent's end.
 func (c *Client) TriggerPieceDownload(ctx context.Context, id string, byteRange scheduler.ByteRange) error {
-	body, err := json.Marshal(pieceDownloadRequest{Offset: byteRange.Offset, Length: byteRange.Length})
+	pieces, err := c.pieceRangeFor(ctx, id, byteRange)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(pieceDownloadRequest{Ranges: []pieceRange{pieces}})
 	if err != nil {
 		return fmt.Errorf("encoding piece-download request: %w", err)
 	}
@@ -288,6 +369,45 @@ func (c *Client) TriggerPieceDownload(ctx context.Context, id string, byteRange 
 	}
 	defer resp.Body.Close()
 	return checkStatus(resp, "triggering piece download")
+}
+
+func (c *Client) pieceRangeFor(ctx context.Context, id string, byteRange scheduler.ByteRange) (pieceRange, error) {
+	resp, err := c.authedRequest(ctx, http.MethodGet, "/api/v1/torrents/"+id+"/status", nil, "")
+	if err != nil {
+		return pieceRange{}, fmt.Errorf("getting torrent status: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return pieceRange{}, fmt.Errorf("getting torrent status failed with status %d: %s", resp.StatusCode, respBody)
+	}
+	var status torrentStatusResponse
+	if err := json.Unmarshal(respBody, &status); err != nil {
+		return pieceRange{}, fmt.Errorf("decoding torrent status: %w", err)
+	}
+	return bytesToPieces(byteRange, status.PieceLength, status.Torrent.TotalBytes)
+}
+
+// bytesToPieces converts a byte range into the half-open piece-index range
+// that covers it, clamped to the torrent's last piece.
+func bytesToPieces(byteRange scheduler.ByteRange, pieceLength, totalBytes int64) (pieceRange, error) {
+	if pieceLength <= 0 || totalBytes <= 0 {
+		return pieceRange{}, fmt.Errorf("torrent metadata not ready (piece_length=%d, total_bytes=%d)", pieceLength, totalBytes)
+	}
+	if byteRange.Offset < 0 || byteRange.Length <= 0 {
+		return pieceRange{}, fmt.Errorf("invalid byte range offset=%d length=%d", byteRange.Offset, byteRange.Length)
+	}
+	if byteRange.Offset >= totalBytes {
+		return pieceRange{}, fmt.Errorf("byte offset %d is past the torrent's end (%d bytes)", byteRange.Offset, totalBytes)
+	}
+	endByte := byteRange.Offset + byteRange.Length
+	if endByte > totalBytes {
+		endByte = totalBytes
+	}
+	return pieceRange{
+		Start: byteRange.Offset / pieceLength,
+		End:   (endByte + pieceLength - 1) / pieceLength,
+	}, nil
 }
 
 type torrentListEntry struct {
@@ -350,10 +470,15 @@ func (c *Client) DeleteTorrent(ctx context.Context, id string) (string, error) {
 	return parsed.OperationID, nil
 }
 
+// operationResponse mirrors torrentfs-go's async operation status. State
+// is a lifecycle stage: "deleting" while in flight, then "deleted" or
+// "delete_failed".
 type operationResponse struct {
-	Done  bool   `json:"done"`
+	State string `json:"state"`
 	Error string `json:"error"`
 }
+
+const operationStateDeleting = "deleting"
 
 // GetOperation reports the status of a previously started async operation.
 func (c *Client) GetOperation(ctx context.Context, operationID string) (scheduler.OperationStatus, error) {
@@ -371,5 +496,5 @@ func (c *Client) GetOperation(ctx context.Context, operationID string) (schedule
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return scheduler.OperationStatus{}, fmt.Errorf("decoding operation status: %w", err)
 	}
-	return scheduler.OperationStatus{Done: parsed.Done, Error: parsed.Error}, nil
+	return scheduler.OperationStatus{Done: parsed.State != operationStateDeleting, Error: parsed.Error}, nil
 }

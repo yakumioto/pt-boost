@@ -40,9 +40,9 @@ sites:
 
 1. 调用 M-Team `POST /api/torrent/search`，`sortField=LEECHERS, sortDirection=DESC`，分页拉取（`page_size` 条/页，最多 `max_scan_pages` 页，页间隔 ≥ `request_interval`）。
 2. 客户端过滤：`seeders > seeders_min && leechers > leechers_min`（API 不支持区间参数，必须本地过滤）。
-3. 跳过已在池中的候选（与当前池成员的 infohash 比对，池成员来自第 4 步的分类标签重建）。
+3. 跳过已在池中的候选。候选不带 infohash（M-Team API 不提供，见 ADR 0003）：本进程添加过的候选靠内存缓存 `站点 torrent id → torrentfs-go id` 直接跳过；其余候选先走第 3 节的"下载 + 添加"（torrentfs-go 的添加是幂等的），用返回的 torrent id 与池成员比对。
 4. 若池未满（当前成员数 < `pool_size`）：直接按顺序加入候选。
-5. 若池已满：触发第 2 步"冷种检测"的最新结果，若存在冷种，用排名最高的候选顶替冷种中最差的一个；否则本轮不做替换。
+5. 若池已满：触发第 2 步"冷种检测"的最新结果，若存在冷种，用排名最高的候选顶替冷种中最差的一个（**先添加新种子、确认不是重复，再淘汰冷种**；淘汰失败则回滚刚添加的种子）；否则本轮不做替换，也不下载任何 `.torrent`。
 
 ### 2. 冷种检测（独立轮询，周期建议 2 分钟，覆盖 `cold_window=20m` 窗口）
 
@@ -55,7 +55,7 @@ sites:
 
 1. 调用 M-Team `POST /api/torrent/genDlToken`（**必须 form-encoded**，不能 JSON）拿下载链接。
 2. pt-boost 下载 `.torrent` 文件原始字节。
-3. 调用 torrentfs-go `POST /api/v1/torrents`（multipart 上传该文件）加入种子，拿到 torrentfs-go 内部 torrent id。
+3. 调用 torrentfs-go `POST /api/v1/torrents`（multipart 上传该文件）加入种子，拿到 torrentfs-go 的 torrent id（即 infohash，池以它为键）。若该 id 已是池成员，或已挂着别的分类标签，到此为止，不执行后续步骤。
 4. 调用 torrentfs-go `PUT /api/v1/torrents/{id}/category`，打上该 site 专属标签（如 `boost-mteam`）——这是池成员资格的唯一凭证，也是进程重启后重建池状态的依据。
 5. 调用 torrentfs-go `PUT /api/v1/torrents/{id}/piece-download`，范围 = 从文件头开始、覆盖 `target_share_bytes`（文件小于此值则覆盖全部），一次性触发主动取片，**不经过任何 FUSE 文件读取**。
 6. 之后不再对该种子做主动 piece 管理，后续缓存去留交给 torrentfs-go 自身的全局 LRU 淘汰（v1 简化策略，更复杂的"稀有 piece 优先"留给 v2）。
@@ -68,6 +68,7 @@ sites:
 ### 5. 进程重启恢复
 
 - **不引入本地持久化存储**（无 SQLite/BoltDB）。池成员列表 = `GET /api/v1/torrents` 按分类标签过滤的结果，天然持久化在 torrentfs-go 侧。
+- 不维护重启前的其他状态：`站点 torrent id → torrentfs-go id` 缓存清空，重启后首轮扫描每个仍达标的旧成员多付一次"下载 + 幂等添加"（ADR 0003）。
 - 内存滚动窗口清空重新积累，`cold_window`（20 分钟）内自然恢复冷种判定能力，重启代价可接受。
 
 ### 6. 认证

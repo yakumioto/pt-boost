@@ -20,22 +20,29 @@ import (
 	"github.com/yakumioto/pt-boost/internal/scheduler"
 )
 
-// fakeServer stands in for a real torrentfs-go instance: it implements just
-// enough of the /api/v1 HTTP surface (as pt-boost's client understands it)
-// to drive end-to-end style tests without any network dependency or a real
-// torrentfs-go binary. torrentfs-go has no published OpenAPI spec and no
-// stable release yet (see docs/adr/0001's "事后验证"); this fixture encodes
-// this client's best-effort understanding of the contract, which is the
-// thing an actual wire-level integration test against a running
-// torrentfs-go would need to re-validate.
+// fakeServer stands in for a real torrentfs-go instance. It encodes the
+// /api/v1 contract as verified against torrentfs-go main @ 5936439 and a
+// running instance (2026-11-12), including the parts an earlier version of
+// this fixture got wrong together with the client:
+//   - login takes {"password"} only and rejects unknown fields with 400;
+//   - add returns 201, is idempotent, and the id is the infohash;
+//   - a category must be created (POST /api/v1/categories) before a
+//     torrent can be tagged with it (otherwise 404 "unknown category");
+//   - piece-download takes half-open piece-index ranges and rejects a
+//     range past the last piece with 400;
+//   - an operation reports {"state": "deleting"|"deleted"|...}.
 type fakeServer struct {
 	mu sync.Mutex
 
-	validUsername, validPassword string
-	loginCalls                   int
-	failLoginWith                int // 0 = succeed
+	validPassword string
+	loginCalls    int
+	failLoginWith int // 0 = succeed
 
-	nextID               int
+	pieceLength, totalBytes int64 // reported by /status for every torrent
+	categories              map[string]bool
+	createCategoryCalls     int
+	operationState          string // state reported for delete operations
+
 	entries              map[string]*fakeEntry // id -> entry
 	rejectAddTorrent     bool                  // simulate HTTP 400 "invalid torrent"
 	authFailuresToInject int                   // first N authed requests get a 401
@@ -60,16 +67,18 @@ type categoryCall struct {
 
 type pieceDownloadCall struct {
 	id     string
-	offset int64
-	length int64
+	ranges []pieceRange
 }
 
 func newFakeServer() *fakeServer {
 	return &fakeServer{
-		validUsername: "boost",
-		validPassword: "secret",
-		entries:       map[string]*fakeEntry{},
-		operations:    map[string]operationResponse{},
+		validPassword:  "secret",
+		pieceLength:    4 << 20,
+		totalBytes:     1000 << 20, // 250 pieces
+		categories:     map[string]bool{},
+		operationState: "deleted",
+		entries:        map[string]*fakeEntry{},
+		operations:     map[string]operationResponse{},
 	}
 }
 
@@ -84,6 +93,10 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.requireAuth(w, r, s.handleAddTorrent)
 	case r.Method == http.MethodGet && r.URL.Path == "/api/v1/torrents":
 		s.requireAuth(w, r, s.handleListTorrents)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/categories":
+		s.requireAuth(w, r, s.handleCreateCategory)
+	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/status"):
+		s.requireAuth(w, r, s.handleStatus)
 	case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/category"):
 		s.requireAuth(w, r, s.handleSetCategory)
 	case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/piece-download"):
@@ -118,8 +131,13 @@ func (s *fakeServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req loginRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.Username != s.validUsername || req.Password != s.validPassword {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields() // as torrentfs-go does: a "username" field is a 400
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if req.Password != s.validPassword {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -150,11 +168,39 @@ func (s *fakeServer) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.nextID++
-	id := fmt.Sprintf("t%d", s.nextID)
 	hash := sha1.Sum(content)
-	s.entries[id] = &fakeEntry{infoHash: hex.EncodeToString(hash[:])}
-	writeJSON(w, http.StatusOK, addTorrentResponse{ID: id})
+	id := hex.EncodeToString(hash[:])
+	if e, ok := s.entries[id]; !ok || e.deleted {
+		s.entries[id] = &fakeEntry{infoHash: id}
+	}
+	writeJSON(w, http.StatusCreated, addTorrentResponse{ID: id})
+}
+
+func (s *fakeServer) handleCreateCategory(w http.ResponseWriter, r *http.Request) {
+	s.createCategoryCalls++
+	var req createCategoryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if s.categories[req.Name] {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "category already exists"})
+		return
+	}
+	s.categories[req.Name] = true
+	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name})
+}
+
+func (s *fakeServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	id := extractID(r.URL.Path, "/status")
+	if e, ok := s.entries[id]; !ok || e.deleted {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"torrent":      map[string]any{"id": id, "total_bytes": s.totalBytes},
+		"piece_length": s.pieceLength,
+	})
 }
 
 func (s *fakeServer) handleListTorrents(w http.ResponseWriter, r *http.Request) {
@@ -180,6 +226,10 @@ func (s *fakeServer) handleSetCategory(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if !s.categories[req.Category] {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown category"})
+		return
+	}
 	e.category = req.Category
 	s.setCategoryCalls = append(s.setCategoryCalls, categoryCall{id: id, category: req.Category})
 	w.WriteHeader(http.StatusOK)
@@ -196,8 +246,19 @@ func (s *fakeServer) handlePieceDownload(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	s.pieceDownloadCalls = append(s.pieceDownloadCalls, pieceDownloadCall{id: id, offset: req.Offset, length: req.Length})
-	w.WriteHeader(http.StatusOK)
+	if len(req.Ranges) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ranges is required and must not be empty"})
+		return
+	}
+	pieceCount := (s.totalBytes + s.pieceLength - 1) / s.pieceLength
+	for _, rg := range req.Ranges {
+		if rg.Start < 0 || rg.End <= rg.Start || rg.End > pieceCount {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "range is out of bounds"})
+			return
+		}
+	}
+	s.pieceDownloadCalls = append(s.pieceDownloadCalls, pieceDownloadCall{id: id, ranges: req.Ranges})
+	writeJSON(w, http.StatusAccepted, map[string]any{"state": "running"})
 }
 
 func (s *fakeServer) handleDeleteTorrent(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +271,7 @@ func (s *fakeServer) handleDeleteTorrent(w http.ResponseWriter, r *http.Request)
 	e.deleted = true
 	s.deleteCalls = append(s.deleteCalls, id)
 	opID := "op-" + id
-	s.operations[opID] = operationResponse{Done: true}
+	s.operations[opID] = operationResponse{State: s.operationState}
 	writeJSON(w, http.StatusAccepted, deleteTorrentResponse{OperationID: opID})
 }
 
@@ -248,7 +309,7 @@ func newTestClient(t *testing.T, server *fakeServer, opts ...Option) (*Client, *
 	t.Helper()
 	ts := httptest.NewServer(server)
 	t.Cleanup(ts.Close)
-	c := New(ts.URL, server.validUsername, server.validPassword, opts...)
+	c := New(ts.URL, "ignored-username", server.validPassword, opts...)
 	return c, ts
 }
 
@@ -314,6 +375,15 @@ func TestAddTorrent_Success_ReturnsID(t *testing.T) {
 	if id == "" {
 		t.Error("AddTorrent returned empty id")
 	}
+
+	// ADR 0003 depends on this: re-adding is a success with the same id.
+	again, err := c.AddTorrent(context.Background(), []byte("d8:announce...torrent-bytes"))
+	if err != nil {
+		t.Fatalf("re-adding the same torrent returned error: %v", err)
+	}
+	if again != id {
+		t.Errorf("re-add returned id %q, want the same id %q", again, id)
+	}
 }
 
 func TestAddTorrent_InvalidTorrent_ReturnsErrInvalidTorrent(t *testing.T) {
@@ -330,46 +400,102 @@ func TestAddTorrent_InvalidTorrent_ReturnsErrInvalidTorrent(t *testing.T) {
 	}
 }
 
-func TestSetCategory_Success(t *testing.T) {
+// TestSetCategory_CreatesCategoryOnce: torrentfs-go refuses to tag a
+// torrent with a category that does not exist yet, so the client creates
+// it first — once per process, and tolerating "already exists" (e.g. after
+// a restart).
+func TestSetCategory_CreatesCategoryOnce(t *testing.T) {
 	server := newFakeServer()
+	server.categories["boost-mteam"] = true // survives from a previous process
 	c, _ := newTestClient(t, server)
 	ctx := context.Background()
 
-	id, err := c.AddTorrent(ctx, []byte("content-a"))
+	idA, err := c.AddTorrent(ctx, []byte("content-a"))
 	if err != nil {
 		t.Fatalf("AddTorrent returned error: %v", err)
 	}
+	idB, _ := c.AddTorrent(ctx, []byte("content-b"))
 
-	if err := c.SetCategory(ctx, id, "boost-mteam"); err != nil {
-		t.Fatalf("SetCategory returned error: %v", err)
+	for _, id := range []string{idA, idB} {
+		if err := c.SetCategory(ctx, id, "boost-mteam"); err != nil {
+			t.Fatalf("SetCategory(%s) returned error: %v", id, err)
+		}
 	}
 
-	if len(server.setCategoryCalls) != 1 || server.setCategoryCalls[0].id != id || server.setCategoryCalls[0].category != "boost-mteam" {
-		t.Errorf("setCategoryCalls = %+v, want exactly one call for id=%s category=boost-mteam", server.setCategoryCalls, id)
+	if len(server.setCategoryCalls) != 2 || server.setCategoryCalls[0] != (categoryCall{id: idA, category: "boost-mteam"}) {
+		t.Errorf("setCategoryCalls = %+v, want two calls starting with id=%s category=boost-mteam", server.setCategoryCalls, idA)
+	}
+	if server.createCategoryCalls != 1 {
+		t.Errorf("create-category called %d times, want 1", server.createCategoryCalls)
 	}
 }
 
-func TestTriggerPieceDownload_SendsConfiguredOffsetAndLength(t *testing.T) {
+func TestSetCategory_CreatesMissingCategory(t *testing.T) {
 	server := newFakeServer()
 	c, _ := newTestClient(t, server)
 	ctx := context.Background()
 
-	id, err := c.AddTorrent(ctx, []byte("content-b"))
-	if err != nil {
-		t.Fatalf("AddTorrent returned error: %v", err)
+	id, _ := c.AddTorrent(ctx, []byte("content-a"))
+	if err := c.SetCategory(ctx, id, "boost-mteam"); err != nil {
+		t.Fatalf("SetCategory returned error: %v", err)
 	}
+	if !server.categories["boost-mteam"] || server.entries[id].category != "boost-mteam" {
+		t.Errorf("category not created/applied: categories=%v entry=%+v", server.categories, server.entries[id])
+	}
+}
 
-	byteRange := scheduler.ByteRange{Offset: 0, Length: 256 * 1024 * 1024}
-	if err := c.TriggerPieceDownload(ctx, id, byteRange); err != nil {
-		t.Fatalf("TriggerPieceDownload returned error: %v", err)
+// TestTriggerPieceDownload_ConvertsBytesToPieceRange: the scheduler speaks
+// bytes, torrentfs-go speaks half-open piece-index ranges.
+func TestTriggerPieceDownload_ConvertsBytesToPieceRange(t *testing.T) {
+	cases := []struct {
+		name       string
+		totalBytes int64
+		byteRange  scheduler.ByteRange
+		want       pieceRange
+	}{
+		{"whole pieces", 1000 << 20, scheduler.ByteRange{Offset: 0, Length: 256 << 20}, pieceRange{Start: 0, End: 64}},
+		{"partial trailing piece is included", 1000 << 20, scheduler.ByteRange{Offset: 0, Length: 5 << 20}, pieceRange{Start: 0, End: 2}},
+		{"clamped to a torrent smaller than the range", 10<<20 + 1, scheduler.ByteRange{Offset: 0, Length: 256 << 20}, pieceRange{Start: 0, End: 3}},
+		{"non-zero offset", 1000 << 20, scheduler.ByteRange{Offset: 6 << 20, Length: 4 << 20}, pieceRange{Start: 1, End: 3}},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newFakeServer()
+			server.totalBytes = tc.totalBytes
+			c, _ := newTestClient(t, server)
+			ctx := context.Background()
 
-	if len(server.pieceDownloadCalls) != 1 {
-		t.Fatalf("pieceDownloadCalls = %+v, want exactly one call", server.pieceDownloadCalls)
+			id, err := c.AddTorrent(ctx, []byte("content-b"))
+			if err != nil {
+				t.Fatalf("AddTorrent returned error: %v", err)
+			}
+			if err := c.TriggerPieceDownload(ctx, id, tc.byteRange); err != nil {
+				t.Fatalf("TriggerPieceDownload returned error: %v", err)
+			}
+
+			if len(server.pieceDownloadCalls) != 1 {
+				t.Fatalf("pieceDownloadCalls = %+v, want exactly one call", server.pieceDownloadCalls)
+			}
+			got := server.pieceDownloadCalls[0]
+			if got.id != id || len(got.ranges) != 1 || got.ranges[0] != tc.want {
+				t.Errorf("piece download call = %+v, want id=%s ranges=[%+v]", got, id, tc.want)
+			}
+		})
 	}
-	got := server.pieceDownloadCalls[0]
-	if got.id != id || got.offset != byteRange.Offset || got.length != byteRange.Length {
-		t.Errorf("piece download call = %+v, want id=%s offset=%d length=%d", got, id, byteRange.Offset, byteRange.Length)
+}
+
+func TestTriggerPieceDownload_MetadataNotReadyReturnsError(t *testing.T) {
+	server := newFakeServer()
+	server.pieceLength = 0
+	c, _ := newTestClient(t, server)
+	ctx := context.Background()
+
+	id, _ := c.AddTorrent(ctx, []byte("content-b"))
+	if err := c.TriggerPieceDownload(ctx, id, scheduler.ByteRange{Offset: 0, Length: 1 << 20}); err == nil {
+		t.Fatal("want error when piece_length is unknown, got nil")
+	}
+	if len(server.pieceDownloadCalls) != 0 {
+		t.Errorf("piece-download must not be sent without a piece length, got %+v", server.pieceDownloadCalls)
 	}
 }
 
@@ -455,6 +581,26 @@ func TestGetOperation_ReturnsDoneStatus(t *testing.T) {
 	}
 	if status.Error != "" {
 		t.Errorf("operation status Error = %q, want empty", status.Error)
+	}
+}
+
+func TestGetOperation_DeletingIsNotDone(t *testing.T) {
+	server := newFakeServer()
+	server.operationState = "deleting"
+	c, _ := newTestClient(t, server)
+	ctx := context.Background()
+
+	id, _ := c.AddTorrent(ctx, []byte("content-a"))
+	opID, err := c.DeleteTorrent(ctx, id)
+	if err != nil {
+		t.Fatalf("DeleteTorrent returned error: %v", err)
+	}
+	status, err := c.GetOperation(ctx, opID)
+	if err != nil {
+		t.Fatalf("GetOperation returned error: %v", err)
+	}
+	if status.Done {
+		t.Errorf("operation status Done = true while state is deleting")
 	}
 }
 

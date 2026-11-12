@@ -13,7 +13,6 @@ import (
 type fakeSite struct {
 	candidates     []Candidate
 	downloadTokens map[string]string
-	details        map[string]Detail
 	calls          *[]string // optional shared call-order log, see newCallLog
 
 	searchCalls int
@@ -42,14 +41,6 @@ func (f *fakeSite) GetDownloadToken(ctx context.Context, torrentID string) (stri
 	return token, nil
 }
 
-func (f *fakeSite) GetTorrentDetail(ctx context.Context, torrentID string) (Detail, error) {
-	d, ok := f.details[torrentID]
-	if !ok {
-		return Detail{}, fmt.Errorf("fakeSite: no detail stubbed for torrent %q", torrentID)
-	}
-	return d, nil
-}
-
 // fakeFetcher maps a download token to canned .torrent bytes.
 type fakeFetcher struct {
 	files map[string][]byte
@@ -68,7 +59,7 @@ func (f *fakeFetcher) Fetch(ctx context.Context, downloadToken string) ([]byte, 
 }
 
 // fakeTorrentFSEntry is one torrent as tracked by fakeTorrentFS, keyed by
-// the id AddTorrent assigns it.
+// its torrentfs id.
 type fakeTorrentFSEntry struct {
 	infoHash      string
 	category      string
@@ -80,7 +71,10 @@ type fakeTorrentFSEntry struct {
 // fakeTorrentFS is an in-memory TorrentFSClient double. infoHashByBytes
 // lets tests control which InfoHash a given set of .torrent bytes maps to,
 // so AddTorrent can report a deterministic identity without a real
-// bencode/SHA1 implementation.
+// bencode/SHA1 implementation. It mirrors the two torrentfs-go properties
+// Scheduler depends on (ADR 0003): AddTorrent's id is the infohash, and
+// re-adding an already-managed torrent is an idempotent success returning
+// that same id.
 type fakeTorrentFS struct {
 	// mu guards every field below. A real torrentfs-go REST client would
 	// be hit by both the scan loop and the cold-detection loop (see
@@ -93,7 +87,7 @@ type fakeTorrentFS struct {
 
 	entries         map[string]*fakeTorrentFSEntry // by torrentfs id
 	infoHashByBytes map[string]string              // string(bytes) -> infohash
-	nextID          int
+	deleteErr       error                          // if set, DeleteTorrent fails with it
 	calls           *[]string
 
 	addTorrentCalls         int
@@ -131,10 +125,10 @@ func (f *fakeTorrentFS) AddTorrent(ctx context.Context, torrentBytes []byte) (st
 	if !ok {
 		return "", fmt.Errorf("fakeTorrentFS: no infohash stubbed for these bytes")
 	}
-	f.nextID++
-	id := fmt.Sprintf("tfs-%d", f.nextID)
-	f.entries[id] = &fakeTorrentFSEntry{infoHash: infoHash}
-	return id, nil
+	if e, ok := f.entries[infoHash]; !ok || e.deleted {
+		f.entries[infoHash] = &fakeTorrentFSEntry{infoHash: infoHash}
+	}
+	return infoHash, nil
 }
 
 func (f *fakeTorrentFS) SetCategory(ctx context.Context, id, category string) error {
@@ -196,6 +190,9 @@ func (f *fakeTorrentFS) DeleteTorrent(ctx context.Context, id string) (string, e
 		*f.calls = append(*f.calls, "TorrentFS.DeleteTorrent")
 	}
 	f.deleteTorrentCalls = append(f.deleteTorrentCalls, id)
+	if f.deleteErr != nil {
+		return "", f.deleteErr
+	}
 	e, ok := f.entries[id]
 	if !ok {
 		return "", fmt.Errorf("fakeTorrentFS: unknown id %q", id)
