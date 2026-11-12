@@ -1,0 +1,187 @@
+package mteam
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+
+	"github.com/yakumioto/pt-boost/internal/scheduler"
+)
+
+var (
+	_ scheduler.Site               = (*Client)(nil)
+	_ scheduler.TorrentFileFetcher = (*Client)(nil)
+)
+
+// searchRequest mirrors the TorrentSearch request schema documented in the
+// M-Team API guide. Mode is set to "all" (one of the guide's documented
+// enum values) so pt-boost's "scan every mode" default (see GLOSSARY.md /
+// design-overview.md Q5) does not rely on an undocumented server default.
+type searchRequest struct {
+	PageNumber    int    `json:"pageNumber"`
+	PageSize      int    `json:"pageSize"`
+	Mode          string `json:"mode"`
+	SortField     string `json:"sortField"`
+	SortDirection string `json:"sortDirection"`
+}
+
+// searchResponseData is this adapter's best-effort understanding of
+// /api/torrent/search's "data" payload: a page of results plus paging
+// metadata. Unverified against an official schema — see package doc.
+type searchResponseData struct {
+	Data []searchResultItem `json:"data"`
+}
+
+type searchResultItem struct {
+	ID     flexString    `json:"id"`
+	Status torrentStatus `json:"status"`
+}
+
+type torrentStatus struct {
+	Seeders  flexInt `json:"seeders"`
+	Leechers flexInt `json:"leechers"`
+}
+
+// detailRequest is the documented /api/torrent/detail request body. Origin
+// is marked required in the v2.2 spec; the guide notes the server
+// tolerates its absence, but this adapter sends it anyway.
+type detailRequest struct {
+	ID     string `json:"id"`
+	Origin string `json:"origin"`
+}
+
+type detailResponseData struct {
+	InfoHash flexString `json:"infoHash"`
+}
+
+// SearchHotTorrents implements scheduler.Site. It pages through
+// /api/torrent/search sorted by LEECHERS descending (respecting the
+// guide's ≥2.5s inter-search pacing), locally pre-filters out candidates
+// that are certain to fail the scheduler's own seeders/leechers thresholds
+// (a pure performance optimization — the scheduler package remains the
+// sole authority on pool-membership decisions), and resolves each
+// surviving candidate's InfoHash via GetTorrentDetail, since M-Team's
+// search results are not known to carry InfoHash directly (see package doc
+// and internal/scheduler/interfaces.go's Detail comment, which anticipated
+// exactly this case).
+func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchParams) ([]scheduler.Candidate, error) {
+	var raw []searchResultItem
+
+	for page := 1; page <= params.MaxPages; page++ {
+		c.paceSearch()
+
+		req := searchRequest{
+			PageNumber:    page,
+			PageSize:      params.PageSize,
+			Mode:          "all",
+			SortField:     "LEECHERS",
+			SortDirection: "DESC",
+		}
+		env, err := c.doJSON(ctx, "/api/torrent/search", req)
+		if err != nil {
+			return nil, fmt.Errorf("searching page %d: %w", page, err)
+		}
+
+		var data searchResponseData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return nil, fmt.Errorf("decoding search page %d: %w", page, err)
+		}
+
+		raw = append(raw, data.Data...)
+		if len(data.Data) < params.PageSize {
+			break // short page: no more results to page through
+		}
+	}
+
+	var candidates []scheduler.Candidate
+	for _, item := range raw {
+		seeders := int(item.Status.Seeders)
+		leechers := int(item.Status.Leechers)
+		if seeders <= c.seedersMin || leechers <= c.leechersMin {
+			continue
+		}
+
+		c.paceOther()
+		detail, err := c.GetTorrentDetail(ctx, string(item.ID))
+		if err != nil {
+			return nil, fmt.Errorf("resolving detail for torrent %s: %w", item.ID, err)
+		}
+
+		candidates = append(candidates, scheduler.Candidate{
+			TorrentID: string(item.ID),
+			InfoHash:  detail.InfoHash,
+			Seeders:   seeders,
+			Leechers:  leechers,
+		})
+	}
+
+	return candidates, nil
+}
+
+// GetDownloadToken implements scheduler.Site. genDlToken must be sent as
+// application/x-www-form-urlencoded — the guide documents JSON as a known
+// server-side bug for this endpoint specifically.
+func (c *Client) GetDownloadToken(ctx context.Context, torrentID string) (string, error) {
+	c.paceOther()
+
+	form := url.Values{"id": {torrentID}}
+	env, err := c.doForm(ctx, "/api/torrent/genDlToken", form)
+	if err != nil {
+		return "", fmt.Errorf("getting download token for torrent %s: %w", torrentID, err)
+	}
+
+	var token string
+	if err := json.Unmarshal(env.Data, &token); err != nil {
+		return "", fmt.Errorf("decoding download token for torrent %s: %w", torrentID, err)
+	}
+	return token, nil
+}
+
+// GetTorrentDetail implements scheduler.Site. Callers that already paced
+// via paceOther (SearchHotTorrents) should not pace again; GetTorrentDetail
+// called directly paces itself.
+func (c *Client) GetTorrentDetail(ctx context.Context, torrentID string) (scheduler.Detail, error) {
+	req := detailRequest{ID: torrentID, Origin: "DETAIL"}
+	env, err := c.doJSON(ctx, "/api/torrent/detail", req)
+	if err != nil {
+		return scheduler.Detail{}, fmt.Errorf("getting detail for torrent %s: %w", torrentID, err)
+	}
+
+	var data detailResponseData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		return scheduler.Detail{}, fmt.Errorf("decoding detail for torrent %s: %w", torrentID, err)
+	}
+	if data.InfoHash == "" {
+		return scheduler.Detail{}, fmt.Errorf("detail response for torrent %s did not contain infoHash", torrentID)
+	}
+	return scheduler.Detail{InfoHash: string(data.InfoHash)}, nil
+}
+
+// Fetch implements scheduler.TorrentFileFetcher. M-Team's genDlToken
+// returns a ready-to-use (pre-signed) download URL, so fetching the raw
+// .torrent bytes is a plain unauthenticated GET — no x-api-key needed.
+func (c *Client) Fetch(ctx context.Context, downloadToken string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building download request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("downloading torrent: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("downloading torrent: HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading torrent body: %w", err)
+	}
+	return body, nil
+}
