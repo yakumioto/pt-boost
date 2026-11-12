@@ -1,0 +1,19 @@
+# Go
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+vendor/
+
+# Local config / secrets
+*.local.yaml
+*.local.yml
+.env
+config.local.*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
