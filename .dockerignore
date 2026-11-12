@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+*.local.yaml
+config.yaml
+docs
+*.md
+bin/
+dist/
