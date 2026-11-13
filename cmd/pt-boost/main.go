@@ -6,12 +6,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -71,6 +73,23 @@ func run(configPath string, logger *slog.Logger) error {
 			APIKey:  site.APIKey,
 		}, mteam.WithSearchInterval(site.RequestInterval.Duration))
 
+		// Stable, filesystem-safe identity scoped by site name and category.
+		key := sha256.Sum256([]byte(site.Name + "\x00" + site.Category))
+		history, err := scheduler.OpenRetired(filepath.Join(cfg.StateDir, fmt.Sprintf("%x.retired.json", key)))
+		if err != nil {
+			return fmt.Errorf("loading retirement history for %s: %w", site.Name, err)
+		}
+		// Check write access at startup, before running an unattended scheduler.
+		if err := os.MkdirAll(cfg.StateDir, 0700); err != nil {
+			return err
+		}
+		probe, err := os.CreateTemp(cfg.StateDir, ".write-check-*")
+		if err != nil {
+			return fmt.Errorf("state directory not writable: %w", err)
+		}
+		probe.Close()
+		os.Remove(probe.Name())
+
 		// mteamClient is passed twice below: once as the Site and once as
 		// the TorrentFileFetcher — the same *mteam.Client instance
 		// implements both scheduler interfaces.
@@ -78,13 +97,15 @@ func run(configPath string, logger *slog.Logger) error {
 			Category:          site.Category,
 			PoolSize:          site.PoolSize,
 			SeedersMin:        site.SeedersMin,
+			SeedersMax:        site.SeedersMax,
+			RequireFree:       site.RequireFree,
 			LeechersMin:       site.LeechersMin,
 			MaxScanPages:      site.MaxScanPages,
 			PageSize:          site.PageSize,
 			TargetShareBytes:  site.TargetShareBytes.Bytes,
 			ColdWindow:        site.ColdWindow.Duration,
 			ColdRateThreshold: site.ColdRateThreshold.BytesPerSecond,
-		}, scheduler.WithLogger(siteLogger))
+		}, scheduler.WithLogger(siteLogger), scheduler.WithRetired(history), scheduler.WithCacheMaintenance(torrentFS))
 
 		sites = append(sites, app.SiteRunner{
 			Name:              site.Name,

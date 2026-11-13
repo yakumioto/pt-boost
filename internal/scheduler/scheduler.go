@@ -16,6 +16,8 @@ type Params struct {
 	Category          string
 	PoolSize          int
 	SeedersMin        int
+	SeedersMax        int
+	RequireFree       bool // skip candidates that would cost download quota // exclusive; 0 means no upper bound for legacy callers
 	LeechersMin       int
 	MaxScanPages      int
 	PageSize          int
@@ -34,12 +36,16 @@ type sample struct {
 // member is one hot-torrent pool entry, tracked purely in memory (see
 // GLOSSARY.md "热种池"; no local persistence, per design-overview.md §5).
 type member struct {
-	infoHash      string
-	torrentFSID   string
-	joinedAt      time.Time
-	samples       []sample
-	cold          bool
-	lastRateBytes int64
+	infoHash       string
+	torrentFSID    string
+	joinedAt       time.Time
+	samples        []sample
+	cold           bool
+	lastRateBytes  int64
+	lastRefillAt   time.Time
+	nextRefillAt   time.Time
+	refillFailures int
+	awaitingRefill bool
 }
 
 // PoolMember is the read-only snapshot of one pool entry exposed to callers
@@ -83,6 +89,8 @@ type Scheduler struct {
 	clock     Clock
 	params    Params
 	logger    *slog.Logger
+	retired   *Retired
+	cache     CacheMaintainer
 
 	// mu guards every field below. Runner (internal/app) drives Scan and
 	// DetectColdTorrents for the same Scheduler from two independent,
@@ -140,6 +148,7 @@ func New(site Site, torrentFS TorrentFSClient, fetcher TorrentFileFetcher, clock
 		pool:      make(map[string]*member),
 		knownIDs:  make(map[string]string),
 	}
+	s.retired, _ = OpenRetired("") // application injects persistent history
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -204,11 +213,20 @@ func (s *Scheduler) RebuildFromTorrentFS(ctx context.Context) error {
 		if v.Category != s.params.Category {
 			continue
 		}
+		if s.retired.hasID(v.ID) {
+			if err := s.retired.RememberPending(v.ID, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		s.pool[v.ID] = &member{
 			infoHash:    v.InfoHash,
 			torrentFSID: v.ID,
 			joinedAt:    now,
 		}
+	}
+	if err := s.cleanupRetired(ctx); err != nil {
+		return fmt.Errorf("recovering pending retirement: %w", err)
 	}
 	s.logger.Info("pool rebuilt from torrentfs-go",
 		"category", s.params.Category,
@@ -235,6 +253,9 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	s.lastScanAt = s.clock.Now()
+	if err := s.cleanupRetired(ctx); err != nil {
+		return err
+	}
 
 	candidates, err := s.site.SearchHotTorrents(ctx, SearchParams{
 		MaxPages: s.params.MaxScanPages,
@@ -256,8 +277,14 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	// there (and possibly owned by someone else).
 	var preexisting map[string]string
 
+	SortCandidates(candidates)
+
 	for _, c := range candidates {
-		if c.Seeders <= s.params.SeedersMin || c.Leechers <= s.params.LeechersMin {
+		if s.params.RequireFree && !c.Free {
+			s.logger.Debug("candidate is not free, skipped", "torrent_id", c.TorrentID)
+			continue
+		}
+		if c.Seeders <= s.params.SeedersMin || (s.params.SeedersMax > 0 && c.Seeders >= s.params.SeedersMax) || c.Leechers <= s.params.LeechersMin {
 			s.logger.Debug("candidate below thresholds, skipped",
 				"torrent_id", c.TorrentID,
 				"seeders", c.Seeders,
@@ -267,7 +294,15 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 			)
 			continue
 		}
+		if s.retired.hasSiteID(c.TorrentID) {
+			s.logger.Debug("permanently retired candidate skipped", "torrent_id", c.TorrentID)
+			continue
+		}
 		if id, known := s.knownIDs[c.TorrentID]; known {
+			if s.retired.hasID(id) {
+				continue
+			}
+
 			if _, pooled := s.pool[id]; pooled {
 				s.logger.Debug("candidate already in pool, skipped",
 					"torrent_id", c.TorrentID, "torrentfs_id", id)
@@ -304,7 +339,22 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 			return fmt.Errorf("landing candidate %s: %w", c.TorrentID, err)
 		}
 		s.knownIDs[c.TorrentID] = id
-
+		if s.retired.hasID(id) {
+			if _, existed := preexisting[id]; existed {
+				// Existing tasks outside this pool are never deleted or claimed.
+				if err := s.retired.Remember(id, []string{c.TorrentID}); err != nil {
+					return err
+				}
+			} else {
+				if err := s.retired.RememberPending(id, []string{c.TorrentID}); err != nil {
+					return err
+				}
+				if err := s.evict(ctx, &member{torrentFSID: id}); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if _, pooled := s.pool[id]; pooled {
 			// Idempotent re-add of a member this process didn't know
 			// the site id for (typically: first scan after a restart).
@@ -337,6 +387,7 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 				s.rollbackAdd(ctx, c, id)
 				return fmt.Errorf("evicting cold member %s: %w", worst.torrentFSID, err)
 			}
+			delete(preexisting, worst.torrentFSID) // no stale ownership after confirmed deletion
 		}
 		if err := s.activate(ctx, c, id); err != nil {
 			return fmt.Errorf("landing candidate %s: %w", c.TorrentID, err)
@@ -436,7 +487,11 @@ func (s *Scheduler) activate(ctx context.Context, c Candidate, id string) error 
 // logged, since the caller is already returning the eviction error.
 func (s *Scheduler) rollbackAdd(ctx context.Context, c Candidate, id string) {
 	delete(s.knownIDs, c.TorrentID)
-	if _, err := s.torrentFS.DeleteTorrent(ctx, id); err != nil {
+	op, err := s.torrentFS.DeleteTorrent(ctx, id)
+	if err == nil {
+		err = s.waitDeleted(ctx, op)
+	}
+	if err != nil {
 		s.logger.Warn("rolling back added torrent failed; uncategorized torrent left in torrentfs-go",
 			"torrent_id", c.TorrentID, "torrentfs_id", id, "error", err)
 		return
@@ -448,9 +503,44 @@ func (s *Scheduler) rollbackAdd(ctx context.Context, c Candidate, id string) {
 // evict removes a member from torrentfs-go and drops it (and its sample
 // history) from the pool.
 func (s *Scheduler) evict(ctx context.Context, m *member) error {
-	operationID, err := s.torrentFS.DeleteTorrent(ctx, m.torrentFSID)
+	var aliases []string
+	for siteID, id := range s.knownIDs {
+		if id == m.torrentFSID {
+			aliases = append(aliases, siteID)
+		}
+	}
+	if err := s.retired.RememberPending(m.torrentFSID, aliases); err != nil {
+		return fmt.Errorf("persisting permanent retirement before deletion: %w", err)
+	}
+
+	// A previous attempt may have completed remotely after a polling error.
+	// Reconcile before retrying so a 404 does not strand the member forever.
+	views, err := s.torrentFS.ListTorrents(ctx)
 	if err != nil {
-		return fmt.Errorf("deleting torrent: %w", err)
+		return fmt.Errorf("checking retired torrent: %w", err)
+	}
+	present := false
+	for _, v := range views {
+		if v.ID == m.torrentFSID {
+			if v.Category != "" && v.Category != s.params.Category {
+				return fmt.Errorf("refusing to delete retired torrent %s now owned by category %q", v.ID, v.Category)
+			}
+			present = true
+			break
+		}
+	}
+	operationID := ""
+	if present {
+		operationID, err = s.torrentFS.DeleteTorrent(ctx, m.torrentFSID)
+		if err != nil {
+			return fmt.Errorf("deleting torrent: %w", err)
+		}
+		if err := s.waitDeleted(ctx, operationID); err != nil {
+			return err
+		}
+	}
+	if err := s.retired.complete(m.torrentFSID); err != nil {
+		return err
 	}
 	delete(s.pool, m.torrentFSID)
 	s.logger.Info("cold member evicted from pool",
@@ -527,7 +617,7 @@ func (s *Scheduler) DetectColdTorrents(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return s.refillCaches(ctx)
 }
 
 func pruneBefore(samples []sample, cutoff time.Time) []sample {
@@ -543,4 +633,40 @@ func pruneBefore(samples []sample, cutoff time.Time) []sample {
 		i--
 	}
 	return samples[i:]
+}
+
+// waitDeleted distinguishes acceptance (202) from successful asynchronous
+// completion. On failure/timeout the member remains tracked for retry.
+func (s *Scheduler) waitDeleted(ctx context.Context, operationID string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		status, err := s.torrentFS.GetOperation(ctx, operationID)
+		if err != nil {
+			return fmt.Errorf("confirming deletion %s: %w", operationID, err)
+		}
+		if status.Error != "" {
+			return fmt.Errorf("deletion %s failed: %s", operationID, status.Error)
+		}
+		if status.Done {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for deletion %s: %w", operationID, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// cleanupRetired runs independently of search results and pool capacity.
+// Failed/unfinished deletes survive process restarts, including retired aliases
+// which never acquired a pool category.
+func (s *Scheduler) cleanupRetired(ctx context.Context) error {
+	for id := range s.retired.pending {
+		if err := s.evict(ctx, &member{torrentFSID: id}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

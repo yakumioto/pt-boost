@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/yakumioto/pt-boost/internal/scheduler"
 )
@@ -43,10 +44,56 @@ type searchResultItem struct {
 type torrentStatus struct {
 	Seeders  flexInt `json:"seeders"`
 	Leechers flexInt `json:"leechers"`
+	// Discount is M-Team's promotion state, observed in production as
+	// FREE / PERCENT_50 / NORMAL. Only FREE costs no download quota.
+	Discount flexString `json:"discount"`
+	// DiscountEndTime is "2006-01-02 15:04:05" in site-local time, or
+	// absent/null when the promotion has no expiry.
+	DiscountEndTime flexString `json:"discountEndTime"`
+}
+
+// siteTimeZone is M-Team's site-local clock, which discountEndTime is
+// expressed in without any offset of its own.
+var siteTimeZone = time.FixedZone("CST", 8*60*60)
+
+const (
+	discountFree       = "FREE"
+	discountTimeLayout = "2006-01-02 15:04:05"
+)
+
+// searchSections are the two disjoint halves of M-Team's catalogue.
+// Production probing showed mode "all" does NOT include the R18 section,
+// so the adult section must be searched explicitly; it is searched first
+// because its results are preferred (see scheduler.Candidate.Preferred).
+var searchSections = []struct {
+	mode      string
+	preferred bool
+}{
+	{mode: "adult", preferred: true},
+	{mode: "normal"},
+}
+
+// isFree reports whether downloading costs no quota right now. It fails
+// closed: an unparsable or already-expired promotion counts as not free,
+// so a format change can only cost candidates, never download quota.
+func (s torrentStatus) isFree(now time.Time) bool {
+	if string(s.Discount) != discountFree {
+		return false
+	}
+	end := string(s.DiscountEndTime)
+	if end == "" || end == "null" {
+		return true // promotion without expiry
+	}
+	parsed, err := time.ParseInLocation(discountTimeLayout, end, siteTimeZone)
+	if err != nil {
+		return false
+	}
+	return parsed.After(now)
 }
 
 // SearchHotTorrents implements scheduler.Site. It pages through
-// /api/torrent/search sorted by LEECHERS descending (respecting the
+// /api/torrent/search for the R18 section first and then the normal
+// section, sorted by LEECHERS descending (respecting the
 // guide's ≥2.5s inter-search pacing) and returns one candidate per result,
 // identified by M-Team's own torrent id only. It does not resolve an
 // infohash: M-Team's API does not expose one (/api/torrent/detail returns
@@ -58,35 +105,40 @@ type torrentStatus struct {
 func (c *Client) SearchHotTorrents(ctx context.Context, params scheduler.SearchParams) ([]scheduler.Candidate, error) {
 	var candidates []scheduler.Candidate
 
-	for page := 1; page <= params.MaxPages; page++ {
-		c.paceSearch()
+	for _, section := range searchSections {
+		for page := 1; page <= params.MaxPages; page++ {
+			c.paceSearch()
 
-		req := searchRequest{
-			PageNumber:    page,
-			PageSize:      params.PageSize,
-			Mode:          "all",
-			SortField:     "LEECHERS",
-			SortDirection: "DESC",
-		}
-		env, err := c.doJSON(ctx, "/api/torrent/search", req)
-		if err != nil {
-			return nil, fmt.Errorf("searching page %d: %w", page, err)
-		}
+			req := searchRequest{
+				PageNumber:    page,
+				PageSize:      params.PageSize,
+				Mode:          section.mode,
+				SortField:     "LEECHERS",
+				SortDirection: "DESC",
+			}
+			env, err := c.doJSON(ctx, "/api/torrent/search", req)
+			if err != nil {
+				return nil, fmt.Errorf("searching %s page %d: %w", section.mode, page, err)
+			}
 
-		var data searchResponseData
-		if err := json.Unmarshal(env.Data, &data); err != nil {
-			return nil, fmt.Errorf("decoding search page %d: %w", page, err)
-		}
+			var data searchResponseData
+			if err := json.Unmarshal(env.Data, &data); err != nil {
+				return nil, fmt.Errorf("decoding %s search page %d: %w", section.mode, page, err)
+			}
 
-		for _, item := range data.Data {
-			candidates = append(candidates, scheduler.Candidate{
-				TorrentID: string(item.ID),
-				Seeders:   int(item.Status.Seeders),
-				Leechers:  int(item.Status.Leechers),
-			})
-		}
-		if len(data.Data) < params.PageSize {
-			break // short page: no more results to page through
+			now := time.Now()
+			for _, item := range data.Data {
+				candidates = append(candidates, scheduler.Candidate{
+					TorrentID: string(item.ID),
+					Seeders:   int(item.Status.Seeders),
+					Leechers:  int(item.Status.Leechers),
+					Free:      item.Status.isFree(now),
+					Preferred: section.preferred,
+				})
+			}
+			if len(data.Data) < params.PageSize {
+				break // short page: no more results in this section
+			}
 		}
 	}
 

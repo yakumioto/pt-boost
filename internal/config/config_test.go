@@ -270,3 +270,47 @@ func TestLoad_MissingFileReturnsError(t *testing.T) {
 		t.Fatal("expected error for missing file, got nil")
 	}
 }
+
+func TestParse_StateDirAndSeedersMax(t *testing.T) {
+	cfg, err := Parse([]byte("state_dir: /data\n" + minimalValidYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateDir != "/data" || cfg.Sites[0].SeedersMax != 0 {
+		t.Fatalf("state=%q seeders_max=%d", cfg.StateDir, cfg.Sites[0].SeedersMax)
+	}
+	cfg, err = Parse([]byte(minimalValidYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateDir != "data" {
+		t.Fatalf("default state dir = %q", cfg.StateDir)
+	}
+	// An omitted or zero seeders_max means "no upper bound".
+	if cfg, err := Parse([]byte(minimalValidYAML + "    seeders_max: 0\n")); err != nil || cfg.Sites[0].SeedersMax != 0 {
+		t.Fatalf("seeders_max: 0 must disable the upper bound: %v", err)
+	}
+	if _, err := Parse([]byte(minimalValidYAML + "    seeders_max: 11\n")); err == nil {
+		t.Fatal("accepted impossible seeders range")
+	}
+	if _, err := Parse([]byte(minimalValidYAML + "    seeders_max: -1\n")); err == nil {
+		t.Fatal("accepted negative seeders_max")
+	}
+}
+
+func TestParse_RequireFreeDefaultsToTrue(t *testing.T) {
+	cfg, err := Parse([]byte(minimalValidYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Sites[0].RequireFree {
+		t.Error("require_free must default to true so scanning never spends download quota")
+	}
+	cfg, err = Parse([]byte(minimalValidYAML + "    require_free: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sites[0].RequireFree {
+		t.Error("explicit require_free: false was ignored")
+	}
+}

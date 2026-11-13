@@ -1,0 +1,26 @@
+# Connects to an independently deployed torrentfs-go; never starts another instance.
+# Create config.local.yaml and .env before running docker compose up -d --build.
+services:
+  pt-boost:
+    image: pt-boost:local
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.local.yaml:/etc/pt-boost/config.yaml:ro
+      - pt-boost-state:/data
+    ports:
+      - "127.0.0.1:8081:8081"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  pt-boost-state:
