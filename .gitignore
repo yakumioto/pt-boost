@@ -6,6 +6,9 @@
 *.out
 vendor/
 
+# Persistent local scheduler state
+/data/
+
 # Local config / secrets
 *.local.yaml
 *.local.yml

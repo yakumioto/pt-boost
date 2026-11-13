@@ -87,7 +87,8 @@ type fakeTorrentFS struct {
 
 	entries         map[string]*fakeTorrentFSEntry // by torrentfs id
 	infoHashByBytes map[string]string              // string(bytes) -> infohash
-	deleteErr       error                          // if set, DeleteTorrent fails with it
+	operationStatus *OperationStatus
+	deleteErr       error // if set, DeleteTorrent fails with it
 	calls           *[]string
 
 	addTorrentCalls         int
@@ -202,6 +203,9 @@ func (f *fakeTorrentFS) DeleteTorrent(ctx context.Context, id string) (string, e
 }
 
 func (f *fakeTorrentFS) GetOperation(ctx context.Context, operationID string) (OperationStatus, error) {
+	if f.operationStatus != nil {
+		return *f.operationStatus, nil
+	}
 	return OperationStatus{Done: true}, nil
 }
 

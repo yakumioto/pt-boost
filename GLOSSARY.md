@@ -5,7 +5,7 @@
 ## Language
 
 **热种 (Hot Torrent)**:
-站点搜索结果中满足"做种人数(seeders) > 10 且 下载人数(leechers) > 50"的种子，即已有一定做种基数但下载需求更大、存在明显上传缺口，适合被 pt-boost 寄生做种。
+站点搜索结果中满足人数条件（做种人数(seeders) 高于下限、可选地低于上限，且 下载人数(leechers) 高于下限）且当前为**免费种**的种子，即已有一定做种基数但下载需求更大、存在明显上传缺口，适合被 pt-boost 寄生做种。
 _Avoid_: 热门种子、高热度种子（未限定具体阈值字段时不要用"热种"）
 
 **热种池 (Hot Torrent Pool)**:
@@ -13,11 +13,23 @@ _Avoid_: 热门种子、高热度种子（未限定具体阈值字段时不要�
 _Avoid_: 种子队列、下载队列
 
 **冷种 (Cold Torrent)**:
-热种池内某个种子在连续观察窗口（默认 20 分钟）内上传速率持续低于阈值（默认 < 50KB/s），被判定为已失去上传价值，优先被新候选顶替出池。
+热种池内某个种子在连续观察窗口（默认 20 分钟）内平均上传速率低于可配置阈值（默认 < 100KiB/s），被判定为已失去上传价值，优先被新候选顶替出池。
 _Avoid_: 过期种子、死种
 
+**免费种 (Free Torrent)**:
+M-Team `status.discount` 为 `FREE` 且促销尚未到期（`discountEndTime` 为空表示长期有效）的种子，下载不消耗账号下载量。只有免费种才会被选入热种池。
+_Avoid_: 优惠种、打折种（`PERCENT_50` 等部分优惠不算免费种）
+
+**R18 板块 (R18 Section)**:
+M-Team 搜索 `mode=adult` 对应的成人内容板块，与 `mode=normal` 互斥；生产环境 `mode=all` 不包含该板块。热种候选优先取自该板块，不足时才补充普通板块。
+_Avoid_: 成人分类（容易与站点内容分类号混淆）
+
+**永久淘汰 (Permanent Retirement)**:
+因失去上传价值而退出热种池后，不再被该站点自动选入热种池的状态；不会随时间流逝或服务重启解除。
+_Avoid_: 冷却期、临时禁入（永久淘汰没有自动到期时间）
+
 **做种人数 (Seeders) / 下载人数 (Leechers)**:
-M-Team `/torrent/search` 返回的种子热度字段，只能作为排序字段(`sortField=SEEDERS|LEECHERS`)使用，站点 API 不提供区间过滤，区间过滤（seeders>10 且 leechers>50）必须在 pt-boost 客户端完成。
+M-Team `/torrent/search` 返回的种子热度字段，只能作为排序字段(`sortField=SEEDERS|LEECHERS`)使用，站点 API 不提供区间过滤，区间过滤（seeders/leechers 阈值）必须在 pt-boost 客户端完成。
 _Avoid_: 笼统的"上传量"/"下载量"（必须明确是人数字段还是字节量字段）
 
 **站点适配器 (Site Adapter)**:

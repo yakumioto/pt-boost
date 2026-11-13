@@ -52,6 +52,9 @@ type Client struct {
 	tokenTTL   time.Duration
 	now        func() time.Time
 
+	// refillMu serializes inspect-and-start sequences from this client. REST
+	// has no conditional PUT, so other processes must not manage these tasks.
+	refillMu        sync.Mutex
 	mu              sync.Mutex
 	token           string
 	tokenObtainedAt time.Time
@@ -355,6 +358,8 @@ type torrentStatusResponse struct {
 // up first and the byte range is widened to whole pieces and clamped to
 // the torrent's end.
 func (c *Client) TriggerPieceDownload(ctx context.Context, id string, byteRange scheduler.ByteRange) error {
+	c.refillMu.Lock()
+	defer c.refillMu.Unlock()
 	pieces, err := c.pieceRangeFor(ctx, id, byteRange)
 	if err != nil {
 		return err
@@ -496,5 +501,17 @@ func (c *Client) GetOperation(ctx context.Context, operationID string) (schedule
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return scheduler.OperationStatus{}, fmt.Errorf("decoding operation status: %w", err)
 	}
-	return scheduler.OperationStatus{Done: parsed.State != operationStateDeleting, Error: parsed.Error}, nil
+	switch parsed.State {
+	case operationStateDeleting:
+		return scheduler.OperationStatus{Done: false, Error: parsed.Error}, nil
+	case "deleted":
+		return scheduler.OperationStatus{Done: true, Error: parsed.Error}, nil
+	case "delete_failed":
+		if parsed.Error == "" {
+			parsed.Error = "torrent deletion failed"
+		}
+		return scheduler.OperationStatus{Done: true, Error: parsed.Error}, nil
+	default:
+		return scheduler.OperationStatus{}, fmt.Errorf("unknown deletion operation state %q", parsed.State)
+	}
 }

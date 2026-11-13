@@ -8,6 +8,7 @@ package scheduler
 
 import (
 	"context"
+	"sort"
 	"time"
 )
 
@@ -22,6 +23,14 @@ type Candidate struct {
 	TorrentID string
 	Seeders   int
 	Leechers  int
+	// Free reports that downloading this torrent costs no download quota
+	// right now. A site that cannot determine this must report false:
+	// Scan refuses non-free candidates when RequireFree is set.
+	Free bool
+	// Preferred marks a candidate from the site section the operator
+	// prefers (for M-Team: the R18 section). It only orders candidates;
+	// it never relaxes a threshold.
+	Preferred bool
 }
 
 // SearchParams bounds one PT-site search round. A Site implementation owns
@@ -31,6 +40,14 @@ type Candidate struct {
 type SearchParams struct {
 	MaxPages int
 	PageSize int
+}
+
+// SortCandidates puts preferred-section candidates first while keeping each
+// group's leechers-descending order from the site.
+func SortCandidates(candidates []Candidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Preferred && !candidates[j].Preferred
+	})
 }
 
 // Site is the generic PT-site adapter interface (see GLOSSARY.md "站点适配器

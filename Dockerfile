@@ -17,7 +17,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/pt-boost ./cmd/pt-boost
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/pt-boost ./cmd/pt-boost \
+    && mkdir -p /out/state && touch /out/state/.keep
 
 ## ---- runtime stage ----
 # distroless/static has no shell and no package manager, keeping the final
@@ -28,6 +29,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/pt-boos
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 COPY --from=builder /out/pt-boost /pt-boost
+# Seed a named volume with nonroot ownership for durable retirement history.
+COPY --from=builder --chown=65532:65532 /out/state /data
 
 # pt-boost never bundles a default config: every site's api_key/category/
 # pool_size/etc is deployment-specific (docs/design-overview.md's YAML

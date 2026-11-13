@@ -28,6 +28,7 @@ const defaultStatusListenAddr = ":8081"
 // the list of PT sites to run a scheduler for, and where to serve the
 // read-only GET /status endpoint (docs/design-overview.md §7 / issue #7).
 type Config struct {
+	StateDir  string // persistent permanent eviction history; never put in ephemeral storage
 	TorrentFS TorrentFSConfig
 	Sites     []SiteConfig
 	Status    StatusConfig
@@ -58,6 +59,8 @@ type SiteConfig struct {
 	Category          string
 	PoolSize          int
 	SeedersMin        int
+	SeedersMax        int
+	RequireFree       bool
 	LeechersMin       int
 	ScanInterval      Duration
 	MaxScanPages      int
@@ -73,6 +76,7 @@ type SiteConfig struct {
 // rates). Decoding into these first lets every conversion error be wrapped
 // with the exact dotted/indexed field path it came from.
 type rawConfig struct {
+	StateDir  string          `yaml:"state_dir"`
 	TorrentFS TorrentFSConfig `yaml:"torrentfs"`
 	Sites     []rawSiteConfig `yaml:"sites"`
 	Status    StatusConfig    `yaml:"status"`
@@ -85,6 +89,8 @@ type rawSiteConfig struct {
 	Category          string `yaml:"category"`
 	PoolSize          int    `yaml:"pool_size"`
 	SeedersMin        int    `yaml:"seeders_min"`
+	SeedersMax        int    `yaml:"seeders_max"`
+	RequireFree       *bool  `yaml:"require_free"`
 	LeechersMin       int    `yaml:"leechers_min"`
 	ScanInterval      string `yaml:"scan_interval"`
 	MaxScanPages      int    `yaml:"max_scan_pages"`
@@ -156,7 +162,11 @@ func Parse(data []byte) (*Config, error) {
 		status.ListenAddr = defaultStatusListenAddr
 	}
 
-	return &Config{TorrentFS: raw.TorrentFS, Sites: sites, Status: status}, nil
+	stateDir := raw.StateDir
+	if stateDir == "" {
+		stateDir = "data"
+	}
+	return &Config{StateDir: stateDir, TorrentFS: raw.TorrentFS, Sites: sites, Status: status}, nil
 }
 
 func convertSite(i int, rs rawSiteConfig) (SiteConfig, []error) {
@@ -173,6 +183,17 @@ func convertSite(i int, rs rawSiteConfig) (SiteConfig, []error) {
 		poolSize = defaultPoolSize
 	}
 
+	seedersMax := rs.SeedersMax // 0 disables the upper bound entirely
+	if rs.SeedersMax < 0 {
+		errs = append(errs, fmt.Errorf("%s must not be negative", path("seeders_max")))
+	}
+	if seedersMax > 0 && seedersMax <= rs.SeedersMin+1 {
+		errs = append(errs, fmt.Errorf("%s must exceed seeders_min + 1", path("seeders_max")))
+	}
+	requireFree := true // never spend download quota unless asked to
+	if rs.RequireFree != nil {
+		requireFree = *rs.RequireFree
+	}
 	site := SiteConfig{
 		Name:        rs.Name,
 		APIKey:      rs.APIKey,
@@ -180,6 +201,8 @@ func convertSite(i int, rs rawSiteConfig) (SiteConfig, []error) {
 		Category:    rs.Category,
 		PoolSize:    poolSize,
 		SeedersMin:  rs.SeedersMin,
+		SeedersMax:  seedersMax,
+		RequireFree: requireFree,
 		LeechersMin: rs.LeechersMin,
 
 		MaxScanPages: rs.MaxScanPages,
@@ -190,7 +213,14 @@ func convertSite(i int, rs rawSiteConfig) (SiteConfig, []error) {
 	site.RequestInterval = parseFieldOrAppend(&errs, path("request_interval"), rs.RequestInterval, parseDuration)
 	site.ColdWindow = parseFieldOrAppend(&errs, path("cold_window"), rs.ColdWindow, parseDuration)
 	site.TargetShareBytes = parseFieldOrAppend(&errs, path("target_share_bytes"), rs.TargetShareBytes, parseByteSizeField)
-	site.ColdRateThreshold = parseFieldOrAppend(&errs, path("cold_rate_threshold"), rs.ColdRateThreshold, parseRate)
+	threshold := rs.ColdRateThreshold
+	if threshold == "" {
+		threshold = "100KiB/s"
+	}
+	site.ColdRateThreshold = parseFieldOrAppend(&errs, path("cold_rate_threshold"), threshold, parseRate)
+	if site.ColdRateThreshold.BytesPerSecond <= 0 {
+		errs = append(errs, fmt.Errorf("%s must be positive", path("cold_rate_threshold")))
+	}
 
 	return site, errs
 }
